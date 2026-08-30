@@ -1,3 +1,9 @@
 __pycache__
 .DS_Store
 SampleIPKs
+# CE OTA signing — the PRIVATE half must never be committed.
+# The public key (keys/ce-ota-signing.pub) is deliberately tracked; it is the
+# trust anchor baked into the system image and needs to be reviewable.
+*.key
+*.key.enc
+*.pem

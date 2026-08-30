@@ -1,6 +1,51 @@
-# HP TouchPad OTA Update Guide
+# HP TouchPad community OTA — master guide
 
-This guide explains how to create, stage, and deploy OTA (Over-The-Air) updates to an HP TouchPad running webOS 3.0.5.
+Start here. This is the index for the OTA project, followed by the **low-level flash
+mechanics** that every other document depends on: how a package is staged, how the
+update ramdisk is built and booted, and how to recover a device that gets stuck in it.
+
+---
+
+## Document map
+
+| Document | What it covers | Read it when |
+|----------|----------------|--------------|
+| **This document** | The OTA mechanism itself: building IPKs, session files, `make-update-uimage`, the update ramdisk, recovery | You need to know how the flash actually works, or something failed during one |
+| **`OTA-3.1.0.md`** | Everything for webOS **CE 3.1.0**: trust model, what the image bakes, required client changes, validation, runbook | Working on the community OS release or the system image |
+| **`OTA-3.0.5.md`** | Everything for stock **webOS 3.0.5**: the heterogeneous field population, the OTA Ready bootstrapper, TLS constraints. Plus the abandoned OMA-DM research | Shipping to devices that have not been reflashed |
+| `Update Baselines.md` | The A–H device baseline matrix and L/T/Q axes | Interpreting a device fingerprint |
+| `webos-update-server/DEPLOY.md` | Deploying and configuring the update server | Standing up or moving the server |
+| `otaready-app/CLAUDE.md` | The OTA Ready app: architecture and hard-won on-device lessons | Working on the app or its daemon |
+| `keys/README.md` | The CE OTA signing key, its algorithm and fingerprint | Anything involving payload signing |
+
+**Consolidated 2026-08-30.** `OTA-IMAGE-INTEGRATION.md`, `IMAGE-SIDE-DECISIONS.md` and
+`howto-ota-3.1.0.md` merged into `OTA-3.1.0.md`; `howto-ota-3.0.5.md` and `plan.md`
+merged into `OTA-3.0.5.md`. Those five files are gone — edit the merged documents.
+
+---
+
+## Where the project stands
+
+- The delivery chain is proven end to end on hardware **except the final armed flash**.
+- Payload **signing is designed and the key is baked into 3.1.0, but the daemon does
+  not verify anything yet.** Until it does, an OTA is an unauthenticated root code
+  path — do not ship one to users.
+- There is **no real payload**; the server hosts test packages and a placeholder offer.
+
+Full status in `OTA-3.1.0.md` (Part VII) and `OTA-3.0.5.md` §7.
+
+---
+
+# The OTA mechanism
+
+The rest of this document explains how to create, stage, and deploy OTA updates to an
+HP TouchPad running webOS 3.0.5. **The same mechanism is used on CE 3.1.0** — the
+`ota-scripts`, session files and update ramdisk are unchanged there, confirmed present
+and untouched in the 3.1.0 image.
+
+⚠️ **This describes the manual path, without signature verification.** It is the right
+reference for understanding and debugging the mechanism. Anything delivered to real
+users must additionally satisfy the trust model in `OTA-3.1.0.md` Part II.
 
 ## Prerequisites
 

@@ -141,14 +141,68 @@ bump_su_version() {
     fi
 }
 
+# --- rootfs write window ---------------------------------------------------
+# Patching System Updates writes to the rootfs, which on webOS CE 3.1.0 is
+# mounted READ-ONLY (on stock 3.0.5 it is rw, which is why the original code
+# just remounted rw and never looked back). Leaving / writable afterwards
+# silently removes a protection the image deliberately applies, so every
+# rw window is paired with a restore — including on the failure paths.
+#
+# GOTCHA: /proc/mounts lists "/" TWICE — the initramfs `rootfs` entry, which is
+# always rw, followed by the real store-root ext3, which carries the state we
+# care about. Reading the FIRST match reports rw on a read-only 3.1.0 device and
+# the restore would then be skipped. The effective mount is the LAST one.
+#   rootfs / rootfs rw 0 0
+#   /dev/mapper/store-root / ext3 ro,relatime,... 0 0
+rootfs_is_ro() {
+    _o=$(awk '$2=="/" {o=$4} END {print o}' /proc/mounts 2>/dev/null)
+    case ",$_o," in *,ro,*) return 0 ;; esac
+    return 1
+}
+
+# Open a write window. Sets RO_RESTORE=1 only if we actually changed the state,
+# so we never remount ro on a system that was already rw (i.e. stock 3.0.5).
+rootfs_rw_begin() {
+    RO_RESTORE=0
+    rootfs_is_ro || return 0                       # already writable, nothing to do
+    if mount -o rw,remount / 2>/dev/null; then
+        RO_RESTORE=1
+        log "rootfs: remounted rw (was ro)"
+        return 0
+    fi
+    log "rootfs: FAILED to remount rw — cannot patch"
+    return 1
+}
+
+# Close it. Safe to call unconditionally, including after a failure.
+rootfs_rw_end() {
+    [ "${RO_RESTORE:-0}" = 1 ] || return 0
+    sync                                           # flush before dropping to ro
+    if mount -o ro,remount / 2>/dev/null; then
+        log "rootfs: restored ro"
+    else
+        log "rootfs: WARNING — could not restore ro, / is left writable"
+    fi
+    RO_RESTORE=0
+}
+
 apply_patch() {   # redirect: make System Updates use our server
     if [ ! -f "$PATCHED" ]; then log "patched UpdatesApp.js missing at $PATCHED"; return 1; fi
-    mount -o rw,remount / 2>/dev/null || true
+    rootfs_rw_begin || { echo '{"status":"failed","reason":"rootfs read-only"}' > "$DIR/redirect-result.json"; return 1; }
+
     [ -f "$SU_BAK" ] || cp -p "$SU_JS" "$SU_BAK"                 # save stock JS once
     [ -f "$SU_APPINFO_BAK" ] || cp -p "$SU_APPINFO" "$SU_APPINFO_BAK"  # save stock appinfo once
-    cp "$PATCHED" "$SU_JS"
+    if ! cp "$PATCHED" "$SU_JS"; then
+        log "apply: failed to write $SU_JS"
+        rootfs_rw_end                                            # restore before bailing
+        echo '{"status":"failed","reason":"write failed"}' > "$DIR/redirect-result.json"
+        return 1
+    fi
     chmod 644 "$SU_JS"
     bump_su_version                                             # force Luna to drop cached UpdatesApp.js
+
+    rootfs_rw_end                                               # close the window as soon as writes are done
+
     echo '{"status":"applied"}' > "$DIR/redirect-result.json"
     rm -f "$DIR/.last-contact" "$DIR/.installed"                 # fresh re-point -> state 2, offers re-enabled
     write_server_state false ""
@@ -158,18 +212,19 @@ apply_patch() {   # redirect: make System Updates use our server
 }
 
 revert_patch() {  # revert: restore the stock System Updates app (JS + version)
-    mount -o rw,remount / 2>/dev/null || true
-    if [ -f "$SU_BAK" ]; then
-        cp -p "$SU_BAK" "$SU_JS"; rm -f "$SU_BAK"
-        [ -f "$SU_APPINFO_BAK" ] && { cp -p "$SU_APPINFO_BAK" "$SU_APPINFO"; rm -f "$SU_APPINFO_BAK"; }
-        echo '{"status":"reverted"}' > "$DIR/redirect-result.json"
-        rm -f "$DIR/.last-contact" "$DIR/.installed"            # back to state 1, offers re-enabled
-        write_server_state false ""
-        log "reverted UpdatesApp.js + appinfo"
-        luna_restart
-    else
-        log "no backup to revert"
-    fi
+    if [ ! -f "$SU_BAK" ]; then log "no backup to revert"; return 0; fi
+    rootfs_rw_begin || { echo '{"status":"failed","reason":"rootfs read-only"}' > "$DIR/redirect-result.json"; return 1; }
+
+    cp -p "$SU_BAK" "$SU_JS"; rm -f "$SU_BAK"
+    [ -f "$SU_APPINFO_BAK" ] && { cp -p "$SU_APPINFO_BAK" "$SU_APPINFO"; rm -f "$SU_APPINFO_BAK"; }
+
+    rootfs_rw_end                                               # close the window as soon as writes are done
+
+    echo '{"status":"reverted"}' > "$DIR/redirect-result.json"
+    rm -f "$DIR/.last-contact" "$DIR/.installed"                # back to state 1, offers re-enabled
+    write_server_state false ""
+    log "reverted UpdatesApp.js + appinfo"
+    luna_restart
 }
 
 # install: the direct-update flow (download IPKs from our server -> write

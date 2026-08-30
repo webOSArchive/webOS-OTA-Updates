@@ -5,8 +5,60 @@ set -e
 
 APP=/media/cryptofs/apps/usr/palm/applications/org.webosarchive.otaready
 
-# root fs is normally rw on the TouchPad; remount defensively for /usr and /etc writes
-mount -o rw,remount / 2>/dev/null || true
+# --- rootfs write window ---------------------------------------------------
+# On stock 3.0.5 the rootfs is mounted rw, which is why this script used to just
+# remount rw and never look back. On webOS CE 3.1.0 it is mounted READ-ONLY, so
+# leaving it writable afterwards silently removes a protection the image applies.
+# Every rw window is therefore paired with a restore.
+#
+# These three helpers are duplicated from `device/otaready-daemon` because a
+# postinst must be self-contained — the daemon is a long-running script, not
+# something we can source. KEEP THEM IN SYNC with the copies there.
+#
+# GOTCHA: /proc/mounts lists "/" TWICE — the initramfs `rootfs` entry, which is
+# always rw, then the real store-root ext3 that carries the state we care about.
+# Reading the FIRST match reports rw on a read-only device and the restore is
+# then skipped. The effective mount is the LAST one.
+rootfs_is_ro() {
+    _o=$(awk '$2=="/" {o=$4} END {print o}' /proc/mounts 2>/dev/null)
+    case ",$_o," in *,ro,*) return 0 ;; esac
+    return 1
+}
+
+rootfs_rw_begin() {
+    RO_RESTORE=0
+    rootfs_is_ro || return 0                      # already writable (3.0.5), nothing to do
+    if mount -o rw,remount / 2>/dev/null; then
+        RO_RESTORE=1
+        echo "  rootfs: remounted rw (was ro)"
+        return 0
+    fi
+    return 1
+}
+
+rootfs_rw_end() {
+    [ "${RO_RESTORE:-0}" = 1 ] || return 0
+    sync
+    if mount -o ro,remount / 2>/dev/null; then
+        echo "  rootfs: restored ro"
+    else
+        echo "  rootfs: WARNING — could not restore ro, / is left writable" >&2
+    fi
+    RO_RESTORE=0
+}
+
+# `set -e` is on, so any failure below aborts the script. The EXIT trap is what
+# guarantees the rootfs is still restored on that path — without it, one failed
+# cp would leave / writable forever.
+RO_RESTORE=0
+trap rootfs_rw_end EXIT INT TERM
+
+# Only the /usr/bin and /etc writes below need the window. /media/internal and
+# /var are separate volumes, already writable, and are handled after it closes.
+if ! rootfs_rw_begin; then
+    echo "otaready: ERROR — cannot remount / read-write; aborting install" >&2
+    exit 1
+fi
 
 # fingerprint helper (read-only device inspection) + status daemon +
 # direct-update helper (the daemon's install action shells out to it)
@@ -18,6 +70,9 @@ chmod 755 /usr/bin/ota-fingerprint /usr/bin/otaready-daemon /usr/bin/ota-direct-
 # upstart job so the daemon starts on boot
 cp "$APP/device/otaready-daemon.conf" /etc/event.d/otaready-daemon
 chmod 644 /etc/event.d/otaready-daemon
+
+# rootfs writes are done — close the window before touching /media and /var
+rootfs_rw_end
 
 # status directory the app reads from (inside the app jail this maps to /media/internal)
 mkdir -p /media/internal/.otaready
