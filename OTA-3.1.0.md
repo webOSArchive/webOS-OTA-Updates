@@ -669,6 +669,12 @@ Requirements on the payload format and `post-update`:
   into place. `mv` within a filesystem is `rename(2)`: the running process keeps the
   old inode open and finishes cleanly, while the new file takes the name. **Never
   `cp` over the running daemon.**
+- **Refinement (2026-09-04, from `mmipkg` source):** the *ramdisk* path already
+  satisfies this for free. `mmipkg`'s remove-then-install unlinks the old file and
+  unpacks a new one, so a running `/bin/sh` script keeps its old inode. The hazard
+  is real only on the **hotpatch tier**, where something writes the live file
+  directly — that is where the `mv` discipline must be enforced. Do not conclude
+  from a successful ramdisk self-update that the hotpatch path is also safe.
 - `post-update` must restart the daemon rather than assume a reboot has done it.
 - The daemon must not hold its own files open across the update.
 
@@ -730,6 +736,15 @@ Requirements this places on the payload format:
   has done it.
 - Please add a self-update smoke test to the server-side test matrix: an update
   whose only content is a new `otaready-daemon`.
+- **That smoke test must use a package id `mmipkg` sees as new, or carry the
+  complete package.** An upgrade of an *existing* package id is remove-then-
+  install: `mmipkg` runs `prerm` and deletes every file in the old `.list` before
+  unpacking. A partial single-file ipk reusing an existing id deletes the rest of
+  that package. See `OTA-UPDATE-GUIDE.md`, "What a payload is, and what it can
+  do".
+- **Every OTA `postinst` must `exit 0` unconditionally.** `mmipkg`'s `run_script`
+  aborts the whole update on a nonzero return — much stricter than the `ipkg`
+  Preware drives, and a likely source of "the OTA failed and I don't know why".
 
 If this works, "we baked the wrong thing in 3.1.0" costs one OTA rather than a
 re-flash of every device.
@@ -993,6 +1008,16 @@ itself**, which would make several wish-list items — LunaCE, the TLS stack —
    **Requirement for OTA Ready v2:** record the mount state before remounting and
    restore it afterwards, including on the failure paths. Do not assume the rootfs
    was writable to begin with — on 3.1.0 it is not.
+
+   **Better still, stop patching at runtime.** An OTA payload can write
+   `/usr/palm/applications/` directly — `mmipkg`'s `unpack_data` applies no path
+   restriction, and on the ramdisk path the rootfs is mounted rw by
+   `ota.sh:239-244`. So once signed delivery works, `UpdatesApp.js` can ship *as
+   a payload* rather than as a runtime patch, and this whole remount defect
+   disappears along with the `integcheck` md5sum divergence it causes. It would
+   need the app's `appinfo.json` `version` bumped in the same payload, since
+   webOS serves cached app code. Worth considering for v2 rather than fixing the
+   remount and keeping the patch.
 4. System Updates then behaves normally: Check Now → offer → Install. ✅
 
 The difference from 3.0.5 is what the owner *doesn't* have to do: no TLS suite to
@@ -1069,6 +1094,67 @@ exists, and the image ships without it. Exercise the whole chain unarmed first.
    hardware. Basis of the image side's §10 sequencing concern.
 5. **No real OTA payload exists.** The server hosts test packages and a placeholder
    offer ("webOS Community OTA Test 0.1").
+
+   **A first candidate arrived on 2026-09-04**, from the image side: the CE 3.1.0
+   USB Settings *"Helper not running"* defect. `usbctl-watchd` latches its
+   last-written status **before** confirming the write, so its first write — which
+   happens at ~3 s uptime, ~2 minutes before `/media/internal` mounts — fails
+   silently and the 1 Hz loop early-returns forever. Every CE 3.1.0 device ships
+   broken; the ones that appear healthy were healed by an unrecorded USB event.
+   The fix is a **one-file replacement of `/usr/bin/usbctl-watchd`**. Full
+   analysis and delivery options: `webos-doctor-ce/Docs/USB-SETTINGS-HOTFIX.md`.
+
+   Why it is a good first payload: it is one 17 KB shell script, it needs no
+   ramdisk, its failure mode is benign, and delivering it through Preware instead
+   is *harder* than delivering it by OTA — a Preware ipk lands in
+   `/media/cryptofs/apps` on CE and would register a service against the baked
+   static claim, which `bake.py` documents ls-hubd resolving by dropping both. An
+   OTA writes the rootfs directly and creates no second registration.
+
+   **⚠️ It does not exercise open item #4.** A benign payload bounds the damage of
+   a failed *apply*, not of a broken *flash mechanism*, which strands a device
+   regardless of what it carries. Do not let this payload's harmlessness be read
+   as evidence about the armed flash; #4 still needs its own bench milestone.
+
+### The hotpatch tier — a third delivery shape
+
+The USB candidate exposed a gap in this document: it assumes every payload goes
+through the armed flash. It does not have to.
+
+| Tier | Mechanism | Needs |
+|------|-----------|-------|
+| **Armed flash** | `make-update-uimage` → ramdisk → `PmUpdater` | `updatefsinfo`, `/boot` rewrite, two reboots, open item #4 |
+| **Hotpatch** | signature check, then `mmipkg install` on the running system | nothing beyond M10 |
+
+A hotpatch is the running-system install path with signature verification in
+front of it: fetch signed manifest → `ce-ota-verify` → stage to
+`/var/lib/otaready/` → re-check `sha256` → install → restart the affected job →
+record the serial. No `updatefsinfo`, no `make-update-uimage`, no `/boot` write,
+no reboot.
+
+**This is worth adopting as a first-class tier**, because it separates the two
+risks the project currently carries together. A hotpatch proves signed delivery
+end to end — closing #5 and validating M10, the trust anchor, the manifest
+format and downgrade protection — while touching nothing that can strand a
+device. The armed flash then becomes a *separate* milestone that can be proven on
+a bench device at its own pace, rather than being the gate on shipping anything
+at all.
+
+The manifest format needs no change: it already names packages, their `sha256`
+and their URLs. It should gain a field saying which tier a payload wants, and
+**the daemon must refuse to armed-flash a manifest that did not ask for it** —
+same standing as M3, for the same reason.
+
+Two constraints the hotpatch tier inherits, which the ramdisk path does not:
+
+- **CE's rootfs is read-only at runtime.** Remount rw, and serialise on
+  `/tmp/.ce-rootfs-rw.lock`, which is CE's existing lock for exactly this
+  (`ce-firstboot-tweaks` and `ce-remove-preloads` both take it). Restore `ro`
+  afterwards on every path — see the Part VI defect where the current app does
+  not.
+- **`cp` over a running shell script corrupts it** (M13). The ramdisk path gets
+  this right for free; a hotpatch does not. Stage to a temporary file on the same
+  filesystem and `mv`.
 
 ---
 
