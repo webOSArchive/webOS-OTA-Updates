@@ -120,7 +120,10 @@ offer_uptodate() {
     put "$OFFER" "{\"status\":\"UpToDate\",\"networkAvailable\":true,\"checked\":$(date +%s)}"
 }
 offer_network_failed() {
-    _interval=600                    # try again sooner after a failure
+    # Try again sooner after a failure: every minute for the first five (the boot
+    # check usually runs before Wi-Fi is up), then every 10 minutes.
+    _fails=$(( ${_fails:-0} + 1 ))
+    if [ "$_fails" -le 5 ]; then _interval=60; else _interval=600; fi
     put "$OFFER" "{\"status\":\"NetworkFailed\",\"networkAvailable\":false,\"checked\":$(date +%s)}"
 }
 offer_available() {
@@ -182,13 +185,13 @@ do_check() {
     if [ ! -f "$TRUST_KEY" ] || [ ! -x "$VERIFY" ]; then
         offer_uptodate; write_status UpToDate "no trust anchor in this image"; return
     fi
-    _interval=$CHECK_EVERY
     _url=$(server_url)
     _resp=$(curl -s -f -m 30 --connect-timeout 20 "$_url/api/ce-ota/check?build=$_b&nduid=$(nduid)&client=$CLIENT_VERSION" 2>>"$LOG")
     if [ $? -ne 0 ] || [ -z "$_resp" ]; then
         log "check: server unreachable ($_url)"
         offer_network_failed; write_status NetworkFailed "server unreachable"; return
     fi
+    _interval=$CHECK_EVERY; _fails=0     # the server answered
     _name=$(echo "$_resp" | sed -n 's/.*"manifest" *: *"\([A-Za-z0-9._-]*\)".*/\1/p')
     if ! echo "$_resp" | grep -q '"status" *: *"Available"' || [ -z "$_name" ]; then
         rm -f "$STATE/manifest.json" "$STATE/manifest.json.sig"
@@ -396,6 +399,31 @@ version=$_title"
 version=$_title"
     fi
     rm -f "$STATE/armed" "$INSTALL_STATUS"
+    announce_result
+}
+
+# Show the outcome the way the stock UpdateDaemon did: open System Updates with
+# updateSuccessful / installFailed, which its create() turns into the result
+# screen (Done sends ack). In the background, after ce-ota-finish has stopped
+# (it reinstalls apps for a minute or two on this boot), at most 10 minutes.
+announce_result() {
+    _s=$(sed -n 's/^status=//p' "$STATE/result")
+    _v=$(clean "$(sed -n 's/^version=//p' "$STATE/result")")
+    case "$_s" in
+        InstallSuccessful) _p=updateSuccessful ;;
+        InstallFailed)     _p=installFailed ;;
+        *) return 0 ;;
+    esac
+    (
+        _n=0
+        while initctl status ce-ota-finish 2>/dev/null | grep -q "start/\|(start)" && [ $_n -lt 600 ]; do
+            sleep 5; _n=$((_n + 5))
+        done
+        sleep 5
+        log "after reboot: opening System Updates to show $_s"
+        luna-send -n 1 palm://com.palm.applicationManager/open \
+            "{\"id\":\"com.palm.app.updates\",\"params\":{\"$_p\":true,\"version\":\"$_v\"}}" </dev/null >/dev/null 2>&1
+    ) &
 }
 
 # Until the user taps Done, System Updates shows the outcome instead of an offer.

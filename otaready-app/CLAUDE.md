@@ -6,9 +6,14 @@ Resume-here notes for this sub-project. Read this first.
 
 OTAs start at CE 3.1.0 (community decision: 3.0.5 -> 3.1.0 is a Doctor flash). v3.0.0
 replaces everything 3.0.5-specific below (fingerprint, baselines A-H, redirect button,
-direct-update.sh, the arm-install switch). **Proven on hardware 2026-11-21:** device C
-went 600070 -> 600119 (3.2.0) from System Updates' Install Now, through the stock
-ramdisk, and came back "installed"; ce-ota-finish "finished and verified".
+direct-update.sh, the arm-install switch).
+
+**Proven on hardware 2026-11-21, the way users will do it:** OTA Ready 3.0.0 from App
+Museum II -> System Updates opens by itself with the offer -> Install Now -> download from
+production -> stock ramdisk -> 600119 -> ce-ota-finish "finished and verified" -> System
+Updates opens by itself with "installed" (after ce-ota-finish stops). Two devices
+(c37f7a34..., fresh; c68faf11... "C"). The device filter held: C was UpToDate until its
+nduid was added to releases.json. A 3.0.5 device shows "Not eligible" correctly.
 
 - **Daemon** `device/otaready-daemon` (root, `/usr/bin`, upstart `start on stopped finish`,
   not tied to Luna). Commands via the bridge: `check | install | cancel | ack`.
@@ -23,6 +28,11 @@ ramdisk, and came back "installed"; ce-ota-finish "finished and verified".
     part), sha256, session files in PmUpdater's format, `PmUpdater -v`, re-hash, arm
     (`updating`, make-update-uimage, check the uImage link), reboot. `STATE/armed` + the
     build after the reboot decide InstallSuccessful/InstallFailed, shown until Done (`ack`).
+  - After the update reboot, `announce_result` opens System Updates with
+    `updateSuccessful`/`installFailed` (stock create() shows the result), in the background
+    once `ce-ota-finish` has stopped.
+  - A failed check retries every minute for five tries (the boot check runs before Wi-Fi),
+    then every 10 minutes; a good answer resets to weekly.
   - Bench switches in `/media/internal/.otaready/`: `dry-run` (all steps but arming),
     `server-url` (another server; manifests still need the key).
   - busybox sh arithmetic is 32-bit and dies on overflow: all space math is in KB.
