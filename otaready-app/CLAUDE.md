@@ -20,7 +20,9 @@ nduid was added to releases.json. A 3.0.5 device shows "Not eligible" correctly.
   - check: `GET /api/ce-ota/check?build=<BUILDMARK>&nduid=<id>` -> fetch
     `manifests/<name>.json` + `.sig` -> `/usr/bin/ce-ota-verify` with the baked key ->
     `device/ota-manifest.js` (node 0.4, strict, emits shell vars) -> device-side gates:
-    from-buildmark == this build, pre-flight md5sums file matches, stock kernel. Then
+    HP TouchPad hardware (`/proc/cpuinfo` Hardware TENDERLOIN; a Go is SHORTLOIN, checked
+    first so it is refused for that reason), from-buildmark == this build, pre-flight
+    md5sums file matches, stock kernel. Then
     `offer.json`. Background check at boot and weekly (wall clock); the first time a
     background check finds a release it opens System Updates (as stock UpdateDaemon did).
   - install: first use done, no ce-* job running, space on /media/internal and on / (the

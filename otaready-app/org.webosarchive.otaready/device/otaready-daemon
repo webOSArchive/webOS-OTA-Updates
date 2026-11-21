@@ -54,6 +54,7 @@ MANIFEST_JS=/usr/share/otaready/ota-manifest.js
 NODE=/bin/node
 SESSION=/var/lib/software/SessionFiles
 STOCK_KERNEL=uImage-2.6.35-palm-tenderloin
+HARDWARE=TENDERLOIN                  # the HP TouchPad; the TouchPad Go is SHORTLOIN
 RW_LOCK=/tmp/.ce-rootfs-rw.lock      # CE's own lock for remounting /
 
 SERVER_DEFAULT="https://swupdate.webosarchive.org"
@@ -143,6 +144,7 @@ write_diagnostics() {
         grep -E '^(PRODUCT_VERSION_STRING|BUILDMARK|BUILDNAME)=' /etc/palm-build-info
         echo "nduid: $(nduid)"
         echo "Server: $(server_url)"
+        echo "Hardware: $(hardware)"
         echo "Kernel: /boot/uImage -> $(readlink /boot/uImage)"
         echo "Free /: $(( $(free_kb /) / 1024 )) MB; free /media/internal: $(( $(free_kb /media/internal) / 1024 )) MB"
         echo; echo "--- status.json ---"; cat "$DIR/status.json" 2>/dev/null
@@ -152,6 +154,17 @@ write_diagnostics() {
 }
 
 # --- the device's own safety checks (never the server's to override) -----------
+hardware() { sed -n 's/^Hardware[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo 2>/dev/null | head -1; }
+
+# The payloads are TouchPad rootfs files. Checked first and on its own, so a
+# device that is not a TouchPad is refused for that reason, whatever else it
+# claims (a build number and the other files can be copied; the kernel's
+# machine name cannot).
+hardware_ok() {
+    _hw=$(hardware)
+    [ "$_hw" = "$HARDWARE" ] || { REASON="this update is for the HP TouchPad (this device is ${_hw:-unknown})"; return 1; }
+}
+
 kernel_ok() {
     _k=$(readlink /boot/uImage)
     [ "$_k" = "$STOCK_KERNEL" ] || { REASON="a custom kernel is installed (/boot/uImage -> $_k)"; return 1; }
@@ -164,6 +177,7 @@ kernel_ok() {
 # device-side condition for offering it. Sets REASON on refusal.
 load_manifest() {
     REASON=""
+    hardware_ok || return 1
     [ -f "$STATE/manifest.json" ] || { REASON="no update has been offered"; return 1; }
     "$VERIFY" "$STATE/manifest.json" "$STATE/manifest.json.sig" "$TRUST_KEY" >/dev/null 2>>"$LOG" || { REASON="manifest signature refused"; return 1; }
     _vars=$("$NODE" "$MANIFEST_JS" "$STATE/manifest.json" 2>>"$LOG") || { REASON="manifest not understood by this client"; return 1; }
