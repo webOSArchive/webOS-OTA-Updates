@@ -1,6 +1,6 @@
 /*global fs */
 /*
- * trigger {cmd: "check"|"redirect"|"revert"|"install"}
+ * trigger {cmd: "check"|"install"|"cancel"|"ack"}
  *   -> writes the (whitelisted) word to /media/internal/.otaready/cmd
  *   -> the root otaready-daemon picks it up within ~1s and acts on it.
  *
@@ -12,7 +12,7 @@ var Trigger = function () {
 
 Trigger.prototype = {
   run: function (future) {
-    var ALLOWED = { check: 1, redirect: 1, revert: 1, install: 1, reset: 1 };
+    var ALLOWED = { check: 1, install: 1, cancel: 1, ack: 1 };
     var args = this.controller.args || {};
     var cmd = args.cmd;
     console.log("otaready Trigger.run cmd=" + cmd + " args=" + JSON.stringify(args));

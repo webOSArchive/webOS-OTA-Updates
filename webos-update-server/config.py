@@ -74,6 +74,9 @@ else:
 
 # Optional persistent rotating access log; blank -> stdout/journald only.
 LOG_FILE = _cget("logging", "file", "") or None
+
+# CE OTA payloads (large, not in git). Blank -> <repo>/ce-ota/payloads.
+CE_OTA_PAYLOAD_DIR = _cget("ce_ota", "payload_dir", "")
 # Legacy OMA DM endpoint path (kept for reference)
 DM_ENDPOINT = "/palmcsext/swupdateserver"
 

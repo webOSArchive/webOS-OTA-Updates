@@ -1,337 +1,451 @@
 #!/bin/sh
-# otaready-daemon — root helper for the "Get Ready for OTA" app.
+# otaready-daemon (v2): the root half of the CE OTA client, webOS CE 3.1.0 onward.
 #
-# The jailed Enyo apps cannot read system state or write system files, so this root
-# daemon does both and bridges through /media/internal/.otaready/ (visible in the jail):
-#   - writes status.json  (fingerprint, for the Get-Ready app)      [Part 1]
-#   - writes offer.json    (our server's offer, for System Updates)  [Part 2]
-#   - honors commands dropped in `cmd`: check | redirect | revert | install
+# System Updates (com.palm.app.updates, patched) and the OTA Ready app are jailed:
+# they cannot read system state or write system files. They ask through the
+# org.webosarchive.otaready.service bridge, which writes one word into
+# /media/internal/.otaready/cmd; this daemon does the work as root and answers in
+# files they can read there.
 #
-# Commands are triggered by the apps (via the otaready JS service, which can write cmd).
+#   check    ask the server, verify the signed manifest, write offer.json
+#   install  download, verify, prepare the session files, arm, reboot into the
+#            stock update ramdisk (the steps of the by-hand recipe in
+#            webos-doctor-ce Docs/OTA-HANDOFF.md)
+#   cancel   stop a download (the part already fetched is kept and resumed)
+#   ack      the user has seen the install result; go back to normal offers
+#
+# Background checks (at every boot, then weekly) replace the stock
+# UpdateDaemon's weekly one, which spoke OMA-DM to Palm's dead server. Like it,
+# the first time a background check finds a release, the daemon opens System
+# Updates (applicationManager/open, the call the stock daemon made); once per
+# release, never before first use is finished.
+#
+# Trust: nothing the server says is believed until /usr/bin/ce-ota-verify accepts
+# the manifest's signature against the key baked into the image. The server only
+# decides WHO is offered a release (its releases.json device filter); the signed
+# manifest decides WHAT may be installed and on WHICH build. The checks that
+# protect the device run here and the server cannot switch them off: the manifest
+# must start at this device's build, the pre-flight file must be the image's,
+# there must be no custom kernel, and there must be room.
+#
+# Files (DIR is visible inside the app jails; STATE is root's only):
+#   DIR/offer.json            what System Updates shows (its native payload shape)
+#   DIR/install-status.json   progress of an install
+#   DIR/status.json           a summary for the OTA Ready app
+#   STATE/manifest.json(.sig) the last verified manifest
+#   STATE/armed               written just before the reboot into the ramdisk
+#   STATE/result              the outcome, read after that reboot
+#   STAGE/<payload>.ipk       the download (/media/internal: the ramdisk mounts it)
+#   DIR/dry-run               bench: do every step of install except arming
+#   DIR/server-url            bench: another server (manifests still need the key)
 
 DIR=/media/internal/.otaready
-STATUS="$DIR/status.json"
-OFFER="$DIR/offer.json"
+STATE=/var/lib/otaready
+STAGE=/media/internal/ce-ota
 CMD="$DIR/cmd"
-FP=/usr/bin/ota-fingerprint
-DU=/usr/bin/ota-direct-update
+OFFER="$DIR/offer.json"
+INSTALL_STATUS="$DIR/install-status.json"
 LOG=/var/log/otaready-daemon.log
-REFRESH_EVERY=15   # seconds
-APP_APPINFO=/media/cryptofs/apps/usr/palm/applications/org.webosarchive.otaready/appinfo.json
+LOG_MAX=262144                       # bytes; one old copy is kept
 
-# our update server (override by writing a URL into $DIR/server-url)
+VERIFY=/usr/bin/ce-ota-verify
+TRUST_KEY=/usr/share/ce-ota/keys/ce-ota-signing.pub
+MANIFEST_JS=/usr/share/otaready/ota-manifest.js
+NODE=/bin/node
+SESSION=/var/lib/software/SessionFiles
+STOCK_KERNEL=uImage-2.6.35-palm-tenderloin
+RW_LOCK=/tmp/.ce-rootfs-rw.lock      # CE's own lock for remounting /
+
 SERVER_DEFAULT="https://swupdate.webosarchive.org"
+CHECK_EVERY=604800                   # seconds between background checks: weekly, like stock
+MARGIN_KB=8192                       # slack on every space check
+# Space is counted in KB: busybox sh arithmetic is 32-bit, and 13 GB in bytes
+# does not fit (awk would even print it as 1.3e+10, which ends the shell).
+CLIENT_VERSION=2
 
-# System Updates app + our patched copy
-SU_DIR=/usr/palm/applications/com.palm.app.updates
-SU_JS="$SU_DIR/app/UpdatesApp.js"
-SU_BAK="$SU_JS.otaready-orig"
-SU_APPINFO="$SU_DIR/appinfo.json"
-SU_APPINFO_BAK="$SU_APPINFO.otaready-orig"
-PATCHED=/media/cryptofs/apps/usr/palm/applications/org.webosarchive.otaready/device/UpdatesApp.patched.js
-
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S') otaready: $*" >> "$LOG" 2>&1; }
-server_url() { [ -f "$DIR/server-url" ] && tr -d ' \t\r\n' < "$DIR/server-url" || echo "$SERVER_DEFAULT"; }
-
-luna_restart() {
-    # reload cached Enyo apps after swapping UpdatesApp.js
-    log "restarting LunaSysMgr"
-    killall LunaSysMgr 2>/dev/null || true   # upstart respawns it
+log() {
+    if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt "$LOG_MAX" ]; then mv -f "$LOG" "$LOG.1"; fi
+    echo "$(date '+%Y-%m-%d %H:%M:%S') otaready: $*" >> "$LOG" 2>&1
 }
 
-refresh_status() {
-    if /bin/sh "$FP" --json > "$STATUS.tmp" 2>/dev/null; then
-        mv "$STATUS.tmp" "$STATUS"
-    else
-        rm -f "$STATUS.tmp"; log "fingerprint failed"
+# A file the jail reads: write it whole, then rename, so a reader never sees half.
+put() { printf '%s\n' "$2" > "$1.tmp" && mv -f "$1.tmp" "$1"; }
+
+# Only [A-Za-z0-9 ._:/()+,-] survive into JSON written here.
+clean() { printf '%s' "$1" | tr -cd 'A-Za-z0-9 ._:/()+,-' | cut -c1-120; }
+
+server_url() {
+    # $DIR/server-url points a bench device at another server. It can only change
+    # where manifests come from, never what is accepted: that needs the baked key.
+    if [ -f "$DIR/server-url" ]; then
+        _u=$(tr -d ' \t\r\n' < "$DIR/server-url" | grep -E '^https?://[A-Za-z0-9.:-]+$')
+        [ -n "$_u" ] && { echo "$_u"; return; }
     fi
+    echo "$SERVER_DEFAULT"
 }
 
-# Write server-state.json — the OTA Ready app's view of our relationship with the
-# community server. Drives its three states:
-#   redirected=false                -> state 1 (offer the "Use New Update Server" button)
-#   redirected=true, contacted=false-> state 2 (re-pointed, no confirmed server check yet)
-#   redirected=true, contacted=true -> state 3 (re-pointed + a recorded successful check)
-# "redirected" is ground truth = the System Updates patch is applied (backup exists).
-# "contacted" is sticky since the last re-point: once we get a good server response we
-# remember it in .last-contact (cleared by apply_patch/revert_patch).
-write_server_state() {
-    live_ok="$1"; result="$2"
-    [ -f "$SU_BAK" ] && redirected=true || redirected=false
-    if [ "$live_ok" = true ]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S')|$result" > "$DIR/.last-contact"
-    fi
-    if [ -f "$DIR/.last-contact" ]; then
-        contacted=true
-        lastTime=$(cut -d'|' -f1 < "$DIR/.last-contact")
-        lastResult=$(cut -d'|' -f2 < "$DIR/.last-contact")
-    else
-        contacted=false; lastTime=""; lastResult=""
-    fi
-    printf '{"redirected":%s,"contacted":%s,"serverUrl":"%s","lastContact":"%s","lastResult":"%s"}\n' \
-        "$redirected" "$contacted" "$(server_url)" "$lastTime" "$lastResult" > "$DIR/server-state.json"
-}
+buildmark() { sed -n 's/^BUILDMARK=\([0-9]*\).*/\1/p' /etc/palm-build-info | head -1; }
+nduid() { tr -cd '0-9a-f' < /proc/nduid 2>/dev/null | cut -c1-40; }
+free_kb() { _f=$(df -k "$1" 2>/dev/null | awk -v m="$1" '$NF==m {printf "%d", $(NF-2)}'); echo "${_f:-0}"; }
+mb() { echo $(( ($1 / 1024 + 1023) / 1024 )); }          # bytes -> MB, rounded up
+mb_kb() { echo $(( ($1 + 1023) / 1024 )); }              # KB -> MB, rounded up
+size_of() { wc -c < "$1" 2>/dev/null || echo 0; }
 
-# Produce offer.json (native UpdatesApp payload shape) AND record server-contact state.
-#
-# Model: every ELIGIBLE device gets the same single server-hosted offer
-# (GET /api/updates/offer — one file the server admin edits + git-pushes). A device
-# is eligible unless its local fingerprint rules it out: `ready` is false for a
-# custom kernel, an unsupported model, or a config we can't vouch for. So the offer
-# is content (server) gated by system state (on-device) — not per-baseline.
-#
-# Local overrides still win, for on-device demo/testing:
-#   .installed      -> UpToDate (this cycle's payload already delivered)
-#   test-offer.json -> served verbatim (forced demo offer)
-make_offer() {
-    ready_ok=false
-    grep -q '"ready":true' "$STATUS" 2>/dev/null && ready_ok=true
-
-    resp=$(curl -s -m 15 "$(server_url)/api/updates/offer" 2>/dev/null)
-    live_ok=false
-    echo "$resp" | grep -q '"status"' && live_ok=true
-
-    if [ -f "$DIR/.installed" ]; then
-        printf '{"status":"UpToDate","networkAvailable":true}\n' > "$OFFER"
-        offer_status=UpToDate; src=delivered
-    elif [ -f "$DIR/test-offer.json" ]; then
-        cp "$DIR/test-offer.json" "$OFFER"
-        offer_status=$(grep -o '"status":"[^"]*"' "$DIR/test-offer.json" | head -1 | cut -d'"' -f4)
-        [ -z "$offer_status" ] && offer_status=Available
-        src=demo
-    elif [ "$ready_ok" != true ]; then
-        # ruled out by system state (custom kernel / unsupported model / incompatibility)
-        printf '{"status":"UpToDate","networkAvailable":true}\n' > "$OFFER"
-        offer_status=UpToDate; src=excluded
-    elif [ "$live_ok" = true ]; then
-        printf '%s\n' "$resp" > "$OFFER"      # serve the server's canonical offer verbatim
-        offer_status=$(echo "$resp" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
-        [ -z "$offer_status" ] && offer_status=UpToDate
-        src=server
-    else
-        printf '{"status":"UpToDate","networkAvailable":true}\n' > "$OFFER"
-        offer_status=UpToDate; src=unreachable
-    fi
-
-    # log only when the served offer changes (avoids one line per 15s poll)
-    if [ "$offer_status|$src|$live_ok" != "$_last_offer" ]; then
-        log "offer: $offer_status [$src] (ready=$ready_ok, server contacted=$live_ok)"
-        _last_offer="$offer_status|$src|$live_ok"
-    fi
-
-    write_server_state "$live_ok" "$offer_status"
-}
-
-# Bump com.palm.app.updates' appinfo version by +1 on the last dotted field.
-# REQUIRED after swapping UpdatesApp.js: webOS serves cached app code, so a plain
-# Luna restart re-runs the OLD bytecode unless the version changes (hard-won
-# lesson #1). Incrementing every apply guarantees the patched code is loaded.
-bump_su_version() {
-    cur=$(sed -n 's/.*"version"[ ]*:[ ]*"\([0-9.]*\)".*/\1/p' "$SU_APPINFO" | head -1)
-    if [ -z "$cur" ]; then log "bump: could not read version from $SU_APPINFO"; return 1; fi
-    major=$(echo "$cur" | cut -d. -f1)
-    minor=$(echo "$cur" | cut -d. -f2); [ -z "$minor" ] && minor=0
-    patch=$(echo "$cur" | cut -d. -f3); [ -z "$patch" ] && patch=0
-    new="$major.$minor.$((patch + 1))"
-    tmp="$SU_APPINFO.otaready-tmp"
-    if sed 's/"version"[ ]*:[ ]*"[0-9.]*"/"version": "'"$new"'"/' "$SU_APPINFO" > "$tmp" && cp "$tmp" "$SU_APPINFO"; then
-        rm -f "$tmp"; log "bumped com.palm.app.updates version $cur -> $new (cache-bust)"
-    else
-        rm -f "$tmp"; log "bump: failed to rewrite $SU_APPINFO"; return 1
-    fi
-}
-
-# --- rootfs write window ---------------------------------------------------
-# Patching System Updates writes to the rootfs, which on webOS CE 3.1.0 is
-# mounted READ-ONLY (on stock 3.0.5 it is rw, which is why the original code
-# just remounted rw and never looked back). Leaving / writable afterwards
-# silently removes a protection the image deliberately applies, so every
-# rw window is paired with a restore — including on the failure paths.
-#
-# GOTCHA: /proc/mounts lists "/" TWICE — the initramfs `rootfs` entry, which is
-# always rw, followed by the real store-root ext3, which carries the state we
-# care about. Reading the FIRST match reports rw on a read-only 3.1.0 device and
-# the restore would then be skipped. The effective mount is the LAST one.
-#   rootfs / rootfs rw 0 0
-#   /dev/mapper/store-root / ext3 ro,relatime,... 0 0
+# --- rootfs write window (CE mounts / read-only) -------------------------------
+# /proc/mounts lists "/" twice (initramfs rootfs, then store-root): the LAST is real.
 rootfs_is_ro() {
     _o=$(awk '$2=="/" {o=$4} END {print o}' /proc/mounts 2>/dev/null)
     case ",$_o," in *,ro,*) return 0 ;; esac
     return 1
 }
-
-# Open a write window. Sets RO_RESTORE=1 only if we actually changed the state,
-# so we never remount ro on a system that was already rw (i.e. stock 3.0.5).
 rootfs_rw_begin() {
     RO_RESTORE=0
-    rootfs_is_ro || return 0                       # already writable, nothing to do
-    if mount -o rw,remount / 2>/dev/null; then
-        RO_RESTORE=1
-        log "rootfs: remounted rw (was ro)"
-        return 0
+    _n=0
+    while ! mkdir "$RW_LOCK" 2>/dev/null && [ $_n -lt 60 ]; do sleep 1; _n=$((_n + 1)); done
+    rootfs_is_ro || return 0
+    mount -o rw,remount / 2>/dev/null || { log "rootfs: cannot remount rw"; rmdir "$RW_LOCK" 2>/dev/null; return 1; }
+    RO_RESTORE=1
+}
+rootfs_rw_end() {
+    if [ "${RO_RESTORE:-0}" = 1 ]; then
+        sync
+        mount -o ro,remount / 2>/dev/null || log "rootfs: WARNING could not restore ro"
     fi
-    log "rootfs: FAILED to remount rw — cannot patch"
+    RO_RESTORE=0
+    rmdir "$RW_LOCK" 2>/dev/null
+}
+
+# --- what the jailed apps read ------------------------------------------------
+offer_uptodate() {
+    put "$OFFER" "{\"status\":\"UpToDate\",\"networkAvailable\":true,\"checked\":$(date +%s)}"
+}
+offer_network_failed() {
+    _interval=600                    # try again sooner after a failure
+    put "$OFFER" "{\"status\":\"NetworkFailed\",\"networkAvailable\":false,\"checked\":$(date +%s)}"
+}
+offer_available() {
+    put "$OFFER" "{\"status\":\"Available\",\"version\":\"$M_TITLE\",\"size\":\"$(mb "$M_SIZE")\",\"installTime\":\"$M_MINUTES\",\"networkAvailable\":true,\"checked\":$(date +%s)}"
+}
+write_status() {   # summary for the OTA Ready app
+    put "$DIR/status.json" "{\"client\":$CLIENT_VERSION,\"build\":\"$(buildmark)\",\"version\":\"$(clean "$(sed -n 's/^PRODUCT_VERSION_STRING=//p' /etc/palm-build-info)")\",\"offer\":\"$(clean "$1")\",\"reason\":\"$(clean "$2")\",\"server\":\"$(clean "$(server_url)")\",\"nduid\":\"$(nduid)\",\"time\":$(date +%s)}"
+    write_diagnostics
+}
+
+# The report Save/Send Device Details hand to the curator (no secrets: build,
+# space, kernel link, the last status and the end of this log).
+write_diagnostics() {
+    {
+        echo "webOS Archive OTA Ready diagnostic report (client $CLIENT_VERSION)"
+        echo "Generated: $(date '+%Y-%m-%d %H:%M:%S')"
+        grep -E '^(PRODUCT_VERSION_STRING|BUILDMARK|BUILDNAME)=' /etc/palm-build-info
+        echo "nduid: $(nduid)"
+        echo "Server: $(server_url)"
+        echo "Kernel: /boot/uImage -> $(readlink /boot/uImage)"
+        echo "Free /: $(( $(free_kb /) / 1024 )) MB; free /media/internal: $(( $(free_kb /media/internal) / 1024 )) MB"
+        echo; echo "--- status.json ---"; cat "$DIR/status.json" 2>/dev/null
+        echo; echo "--- install-status.json ---"; cat "$INSTALL_STATUS" 2>/dev/null
+        echo; echo "--- recent daemon log ---"; tail -30 "$LOG" 2>/dev/null
+    } > "$DIR/diagnostics.txt.tmp" 2>/dev/null && mv -f "$DIR/diagnostics.txt.tmp" "$DIR/diagnostics.txt"
+}
+
+# --- the device's own safety checks (never the server's to override) -----------
+kernel_ok() {
+    _k=$(readlink /boot/uImage)
+    [ "$_k" = "$STOCK_KERNEL" ] || { REASON="a custom kernel is installed (/boot/uImage -> $_k)"; return 1; }
+    if grep -qs '^Package: org.webosinternals.kernels\.' /usr/lib/ipkg/status /media/cryptofs/apps/usr/lib/ipkg/status; then
+        REASON="a custom kernel package is installed"; return 1
+    fi
+}
+
+# Load STATE/manifest.json into M_* after checking its signature, then every
+# device-side condition for offering it. Sets REASON on refusal.
+load_manifest() {
+    REASON=""
+    [ -f "$STATE/manifest.json" ] || { REASON="no update has been offered"; return 1; }
+    "$VERIFY" "$STATE/manifest.json" "$STATE/manifest.json.sig" "$TRUST_KEY" >/dev/null 2>>"$LOG" || { REASON="manifest signature refused"; return 1; }
+    _vars=$("$NODE" "$MANIFEST_JS" "$STATE/manifest.json" 2>>"$LOG") || { REASON="manifest not understood by this client"; return 1; }
+    eval "$_vars"
+    [ "$M_TIER" = "armed-flash" ] || { REASON="tier $M_TIER is not one this client installs"; return 1; }
+    [ "$M_FROM" = "$(buildmark)" ] || { REASON="manifest is for build $M_FROM, this device is $(buildmark)"; return 1; }
+    _md5=$(md5sum "$M_PREFLIGHT_PATH" 2>/dev/null | cut -d' ' -f1)
+    [ "$_md5" = "$M_PREFLIGHT_MD5" ] || { REASON="pre-flight: $M_PREFLIGHT_PATH is not the image's (another build)"; return 1; }
+    kernel_ok || return 1
+    return 0
+}
+
+fetch() {   # fetch URL FILE: fail on HTTP errors, bounded time
+    curl -s -f -L -m 60 --connect-timeout 20 -o "$2" "$1" 2>>"$LOG"
+}
+
+do_check() {
+    _b=$(buildmark)
+    if [ ! -f "$TRUST_KEY" ] || [ ! -x "$VERIFY" ]; then
+        offer_uptodate; write_status UpToDate "no trust anchor in this image"; return
+    fi
+    _interval=$CHECK_EVERY
+    _url=$(server_url)
+    _resp=$(curl -s -f -m 30 --connect-timeout 20 "$_url/api/ce-ota/check?build=$_b&nduid=$(nduid)&client=$CLIENT_VERSION" 2>>"$LOG")
+    if [ $? -ne 0 ] || [ -z "$_resp" ]; then
+        log "check: server unreachable ($_url)"
+        offer_network_failed; write_status NetworkFailed "server unreachable"; return
+    fi
+    _name=$(echo "$_resp" | sed -n 's/.*"manifest" *: *"\([A-Za-z0-9._-]*\)".*/\1/p')
+    if ! echo "$_resp" | grep -q '"status" *: *"Available"' || [ -z "$_name" ]; then
+        rm -f "$STATE/manifest.json" "$STATE/manifest.json.sig"
+        offer_uptodate; write_status UpToDate ""
+        [ "$_last_check" = "UpToDate" ] || log "check: up to date (build $_b)"
+        _last_check=UpToDate; return
+    fi
+    mkdir -p "$STATE/new"
+    if ! fetch "$_url/api/ce-ota/manifests/$_name.json" "$STATE/new/manifest.json" ||
+       ! fetch "$_url/api/ce-ota/manifests/$_name.json.sig" "$STATE/new/manifest.json.sig"; then
+        log "check: could not fetch manifest $_name"
+        offer_network_failed; write_status NetworkFailed "manifest download failed"; return
+    fi
+    mv -f "$STATE/new/manifest.json" "$STATE/manifest.json"
+    mv -f "$STATE/new/manifest.json.sig" "$STATE/manifest.json.sig"
+    if load_manifest; then
+        offer_available; write_status Available "$M_NAME"
+        [ "$_last_check" = "$M_NAME" ] || log "check: offering $M_NAME ($M_TITLE)"
+        _last_check=$M_NAME
+        [ "$1" = background ] && notify_once
+    else
+        log "check: $_name not offered: $REASON"
+        rm -f "$STATE/manifest.json" "$STATE/manifest.json.sig"
+        offer_uptodate; write_status UpToDate "$REASON"; _last_check=refused
+    fi
+}
+
+# Tell the user about a release once, the way the stock UpdateDaemon did: open
+# System Updates, which then shows the offer. Only from a background check (a
+# user who asked is already looking), only after first use, once per release.
+notify_once() {
+    [ -f /var/luna/preferences/ran-first-use ] || return 0
+    [ "$(cat "$STATE/notified" 2>/dev/null)" = "$M_NAME" ] && return 0
+    echo "$M_NAME" > "$STATE/notified"
+    log "check: opening System Updates to announce $M_NAME"
+    luna-send -n 1 palm://com.palm.applicationManager/open \
+        '{"id":"com.palm.app.updates","params":{}}' </dev/null >/dev/null 2>&1 &
+}
+
+# --- install -----------------------------------------------------------------
+# Every status carries "t" so the app can ignore one left from an earlier attempt.
+istatus() { put "$INSTALL_STATUS" "$(echo "$1" | sed "s/^{/{\"t\":$(date +%s),/")"; }
+ifail() {
+    log "install: FAILED: $1"
+    istatus "{\"status\":\"failed\",\"reason\":\"$(clean "$1")\"}"
+    rm -f /var/lib/software/updating
+}
+
+sha256_of() { /usr/bin/openssl dgst -sha256 "$1" 2>/dev/null | sed 's/.*= *//'; }
+
+ce_job_running() {   # a CE first-boot job is mid-way: do not reboot under it
+    initctl list 2>/dev/null | grep ') ce-' | grep -v '(stop) waiting' | grep -q .
+}
+
+cancel_requested() {
+    [ -f "$CMD" ] && grep -q cancel "$CMD" 2>/dev/null && { rm -f "$CMD"; return 0; }
     return 1
 }
 
-# Close it. Safe to call unconditionally, including after a failure.
-rootfs_rw_end() {
-    [ "${RO_RESTORE:-0}" = 1 ] || return 0
-    sync                                           # flush before dropping to ro
-    if mount -o ro,remount / 2>/dev/null; then
-        log "rootfs: restored ro"
-    else
-        log "rootfs: WARNING — could not restore ro, / is left writable"
-    fi
-    RO_RESTORE=0
-}
-
-apply_patch() {   # redirect: make System Updates use our server
-    if [ ! -f "$PATCHED" ]; then log "patched UpdatesApp.js missing at $PATCHED"; return 1; fi
-    rootfs_rw_begin || { echo '{"status":"failed","reason":"rootfs read-only"}' > "$DIR/redirect-result.json"; return 1; }
-
-    [ -f "$SU_BAK" ] || cp -p "$SU_JS" "$SU_BAK"                 # save stock JS once
-    [ -f "$SU_APPINFO_BAK" ] || cp -p "$SU_APPINFO" "$SU_APPINFO_BAK"  # save stock appinfo once
-    if ! cp "$PATCHED" "$SU_JS"; then
-        log "apply: failed to write $SU_JS"
-        rootfs_rw_end                                            # restore before bailing
-        echo '{"status":"failed","reason":"write failed"}' > "$DIR/redirect-result.json"
+download() {
+    _part="$STAGE/$M_FILE.part"
+    case "$M_URL" in /*) _src="$(server_url)$M_URL" ;; *) _src="$M_URL" ;; esac
+    log "install: downloading $_src (have $(size_of "$_part") of $M_SIZE)"
+    curl -s -f -L --connect-timeout 30 -C - -o "$_part" "$_src" 2>>"$LOG" &
+    _pid=$!
+    while kill -0 $_pid 2>/dev/null; do
+        # 0-40%: the stock app labels its bar "unpacking" from 45%.
+        istatus "{\"status\":\"downloading\",\"percent\":$(( $(size_of "$_part") / 1024 * 40 / (M_SIZE / 1024) ))}"
+        if cancel_requested; then kill $_pid 2>/dev/null; wait $_pid 2>/dev/null; return 2; fi
+        sleep 2
+    done
+    wait $_pid
+    _rc=$?
+    # curl -C - on a file that is already whole exits 33: fine if the size is right.
+    _got=$(size_of "$_part")
+    if [ "$_got" != "$M_SIZE" ]; then
+        log "install: download ended (curl $_rc) with $_got of $M_SIZE bytes"
+        [ "$_got" -gt "$M_SIZE" ] && rm -f "$_part"
         return 1
     fi
-    chmod 644 "$SU_JS"
-    bump_su_version                                             # force Luna to drop cached UpdatesApp.js
-
-    rootfs_rw_end                                               # close the window as soon as writes are done
-
-    echo '{"status":"applied"}' > "$DIR/redirect-result.json"
-    rm -f "$DIR/.last-contact" "$DIR/.installed"                 # fresh re-point -> state 2, offers re-enabled
-    write_server_state false ""
-    log "applied UpdatesApp.js reroute (backup: $SU_BAK)"
-    sleep 2                                                     # let the app show its "screen will reload" notice
-    luna_restart
-}
-
-revert_patch() {  # revert: restore the stock System Updates app (JS + version)
-    if [ ! -f "$SU_BAK" ]; then log "no backup to revert"; return 0; fi
-    rootfs_rw_begin || { echo '{"status":"failed","reason":"rootfs read-only"}' > "$DIR/redirect-result.json"; return 1; }
-
-    cp -p "$SU_BAK" "$SU_JS"; rm -f "$SU_BAK"
-    [ -f "$SU_APPINFO_BAK" ] && { cp -p "$SU_APPINFO_BAK" "$SU_APPINFO"; rm -f "$SU_APPINFO_BAK"; }
-
-    rootfs_rw_end                                               # close the window as soon as writes are done
-
-    echo '{"status":"reverted"}' > "$DIR/redirect-result.json"
-    rm -f "$DIR/.last-contact" "$DIR/.installed"                # back to state 1, offers re-enabled
-    write_server_state false ""
-    log "reverted UpdatesApp.js + appinfo"
-    luna_restart
-}
-
-# install: the direct-update flow (download IPKs from our server -> write
-# /var/lib/software/SessionFiles -> make-update-uimage -> reboot into the OTA
-# ramdisk). Progress is reported in install-status.json, which the patched
-# System Updates app polls.
-#
-# SAFETY: the download+session-file prep is non-destructive and reversible. The
-# irreversible step (build uimage + reboot into the updater) only runs if
-# $DIR/arm-install exists. Without that flag the daemon preps and stops, so the
-# handoff can be exercised on a test device without any risk of a reboot/flash.
-# mark this update cycle's payload as delivered: subsequent offers resolve to
-# UpToDate (System Updates shows "no more updates", OTA Ready shows up to date).
-mark_installed() {
-    touch "$DIR/.installed"
-    printf '{"status":"UpToDate","networkAvailable":true}\n' > "$OFFER"
+    mv -f "$_part" "$STAGE/$M_FILE"
 }
 
 do_install() {
-    echo '{"status":"preparing"}' > "$DIR/install-status.json"
-    log "install: preparing (direct-update)"
-    url="$(server_url)"
+    istatus '{"status":"preparing","percent":0}'
+    log "install: requested"
+    load_manifest || { ifail "$REASON"; return; }
 
-    if [ ! -x "$DU" ]; then
-        echo '{"status":"failed","reason":"direct-update helper missing"}' > "$DIR/install-status.json"
-        log "install: $DU missing"; return 1
+    [ -f /var/luna/preferences/ran-first-use ] || { ifail "first use is not finished"; return; }
+    ce_job_running && { ifail "the system is still setting up after a restart; try again in a few minutes"; return; }
+
+    # Room on /media/internal for the download, and on / for what the ramdisk
+    # writes. Running out on / inside the ramdisk is the one failure no retry
+    # repairs, so it is checked with the manifest's own numbers.
+    mkdir -p "$STAGE"
+    _have=0
+    [ -f "$STAGE/$M_FILE.part" ] && _have=$(size_of "$STAGE/$M_FILE.part")
+    [ -f "$STAGE/$M_FILE" ] && _have=$M_SIZE
+    _need=$(( (M_SIZE - _have) / 1024 + MARGIN_KB )); _free=$(free_kb /media/internal)
+    if [ "$_free" -lt "$_need" ]; then
+        log "install: /media/internal needs $_need KB, has $_free"
+        istatus "{\"status\":\"spaceneeded\",\"where\":\"media\",\"spaceNeeded\":\"$(mb_kb $(( _need - _free ))) MB\"}"; return
+    fi
+    _need=$(( M_ROOTFS_GROWTH / 1024 + M_LARGEST_FILE / 1024 + MARGIN_KB )); _free=$(free_kb /)
+    if [ "$_free" -lt "$_need" ]; then
+        log "install: / needs $_need KB, has $_free"
+        istatus "{\"status\":\"spaceneeded\",\"where\":\"rootfs\",\"spaceNeeded\":\"$(mb_kb $(( _need - _free ))) MB\"}"; return
     fi
 
-    # download packages + build SessionFiles (non-destructive). -y = non-interactive.
-    if "$DU" "$url" -y >> "$LOG" 2>&1; then
-        if [ -s /var/lib/software/SessionFiles/update_list.txt ]; then
-            log "install: session files prepared"
-        else
-            echo '{"status":"uptodate","note":"server offered no packages"}' > "$DIR/install-status.json"
-            log "install: server offered no packages — nothing to install"
-            return 0
-        fi
-    else
-        echo '{"status":"failed","reason":"prepare failed"}' > "$DIR/install-status.json"
-        log "install: prepare failed"; return 1
+    # Anything else in the stage directory is ours, from an earlier release.
+    for _f in "$STAGE"/*; do
+        [ -e "$_f" ] || continue
+        case "$_f" in "$STAGE/$M_FILE"|"$STAGE/$M_FILE.part") ;; *) rm -f "$_f" ;; esac
+    done
+
+    if [ ! -f "$STAGE/$M_FILE" ]; then
+        download; _rc=$?
+        if [ $_rc -eq 2 ]; then log "install: cancelled"; istatus '{"status":"cancelled"}'; return; fi
+        [ $_rc -eq 0 ] || { ifail "the download did not finish; Install again resumes it"; return; }
     fi
 
-    if [ -f "$DIR/arm-install" ]; then
-        echo '{"status":"installing"}' > "$DIR/install-status.json"
-        log "install: ARMED — building uimage and rebooting into the OTA ramdisk"
-        if /usr/share/ota-scripts/make-update-uimage >> "$LOG" 2>&1; then
-            mark_installed; sync; reboot
-        else
-            echo '{"status":"failed","reason":"make-update-uimage failed"}' > "$DIR/install-status.json"
-            log "install: make-update-uimage failed"
-        fi
-    else
-        mark_installed   # payload delivered (staged); flip the offer to UpToDate
-        echo '{"status":"prepared","note":"not armed; create .otaready/arm-install to flash+reboot"}' > "$DIR/install-status.json"
-        log "install: prepared but NOT armed ($DIR/arm-install absent) — skipping reboot"
+    istatus '{"status":"verifying","percent":41}'
+    if [ "$(sha256_of "$STAGE/$M_FILE")" != "$M_SHA256" ]; then
+        rm -f "$STAGE/$M_FILE"
+        ifail "the download was damaged (sha256) and has been deleted; try again"; return
     fi
+
+    # Session files, in the format PmUpdater reads (not a list of URLs): a header
+    # line, "version=1", then five lines per package. It counts the records.
+    istatus '{"status":"verifying","percent":43}'
+    mkdir -p "$SESSION"
+    rm -f "$SESSION/update_status.txt" "$SESSION/download_status.txt"
+    put "$SESSION/update_list.txt" "$STAGE/$M_FILE"
+    put "$SESSION/install_list.txt" "/rootfs$STAGE/$M_FILE"
+    put "$SESSION/urls" "urls
+version=1
+$M_FILE
+file://$STAGE/$M_FILE
+$M_SIZE
+$M_MD5
+rootfs"
+    /usr/bin/PmUpdater -v >> "$LOG" 2>&1
+    _rc=$?
+    if [ $_rc -ne 0 ] || [ -s "$SESSION/update_status.txt" ]; then
+        ifail "the updater refused the package (PmUpdater -v exit $_rc $(head -c 80 "$SESSION/update_status.txt" 2>/dev/null))"; return
+    fi
+
+    # Last look before the point of no return: /media/internal is USB-exported,
+    # so the file is hashed again, and the device is checked again.
+    istatus '{"status":"verifying","percent":44}'
+    [ "$(sha256_of "$STAGE/$M_FILE")" = "$M_SHA256" ] || { ifail "the download changed after it was checked"; return; }
+    load_manifest || { ifail "$REASON"; return; }
+    ce_job_running && { ifail "the system is busy; try again in a few minutes"; return; }
+
+    # Bench switch: everything above ran for real; stop short of arming.
+    if [ -f "$DIR/dry-run" ]; then
+        log "install: dry run: ready to arm $M_NAME, stopping here (rm $DIR/dry-run to arm)"
+        rm -f "$SESSION/update_list.txt" "$SESSION/install_list.txt" "$SESSION/urls"
+        istatus '{"status":"failed","reason":"dry run: everything checked, not armed"}'
+        return
+    fi
+
+    istatus '{"status":"rebooting","percent":45}'
+    put "$STATE/armed" "from=$M_FROM
+to=$M_TO
+name=$M_NAME
+title=$M_TITLE
+file=$M_FILE
+time=$(date +%s)"
+    log "install: ARMING $M_NAME ($M_FROM -> $M_TO)"
+    echo 1 > /var/lib/software/updating
+    /usr/share/ota-scripts/make-update-uimage </dev/null > /var/log/otaready-uimage.log 2>&1
+    _rc=$?
+    if [ $_rc -ne 0 ] || [ "$(readlink /boot/uImage)" != "update-uimage" ]; then
+        rm -f "$STATE/armed"
+        ifail "could not build the update image (make-update-uimage exit $_rc)"; return
+    fi
+    sleep 3                                   # let System Updates show "restarting"
+    log "install: rebooting into the update ramdisk"
+    killall fbprogress 2>/dev/null
+    sync
+    reboot
+    sleep 120
 }
 
-# Diagnostic report the "Send Device Details" menu item emails to the curator.
-# Regenerated each refresh so it's always current; the app just reads the file.
-write_diagnostics() {
-    appver=$(sed -n 's/.*"version"[ ]*:[ ]*"\([0-9.]*\)".*/\1/p' "$APP_APPINFO" 2>/dev/null | head -1)
-    {
-        echo "webOS Archive — OTA Ready (Beta) diagnostic report"
-        echo "Generated: $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "App version: ${appver:-unknown}"
-        echo "webOS build: $(grep '^BUILDNAME=' /etc/palm-build-info 2>/dev/null | cut -d= -f2)"
-        echo "Uptime (s): $(cut -d. -f1 /proc/uptime 2>/dev/null)"
-        # Parse df fields from the RIGHT (NF-relative): the LVM device name is long
-        # enough that df wraps it to its own line, shifting positional columns and
-        # making $4/$2 read the wrong values (free always came out 0). Anchoring on
-        # the mount-point line and counting back from Mounted-on is wrap-proof:
-        #   ... 1K-blocks Used Available Use% Mounted-on
-        #      NF-4      NF-3 NF-2      NF-1 NF
-        echo "Free space: $(df -k /media/internal 2>/dev/null | awk '$NF=="/media/internal"{printf "%d MB free of %d MB\n", $(NF-2)/1024, $(NF-4)/1024}')"
-        echo
-        echo "--- fingerprint (status.json) ---"
-        cat "$STATUS" 2>/dev/null
-        echo; echo
-        echo "--- update-server state (server-state.json) ---"
-        cat "$DIR/server-state.json" 2>/dev/null
-        echo; echo
-        echo "--- recent daemon log ---"
-        tail -20 "$LOG" 2>/dev/null
-    } > "$DIR/diagnostics.txt.tmp" 2>/dev/null && mv "$DIR/diagnostics.txt.tmp" "$DIR/diagnostics.txt"
+# --- after the reboot ----------------------------------------------------------
+# STATE/armed exists only if we rebooted into the ramdisk. The build we came back
+# as tells how it went: the target build = installed; the old build = the ramdisk
+# refused or failed and ota.sh put the old system back.
+after_reboot() {
+    [ -f "$STATE/armed" ] || return 0
+    _to=$(sed -n 's/^to=//p' "$STATE/armed"); _from=$(sed -n 's/^from=//p' "$STATE/armed")
+    _title=$(sed -n 's/^title=//p' "$STATE/armed"); _file=$(sed -n 's/^file=//p' "$STATE/armed")
+    _now=$(buildmark)
+    if [ "$_now" = "$_to" ]; then
+        log "after reboot: installed $_title ($_from -> $_to)"
+        put "$STATE/result" "status=InstallSuccessful
+version=$_title"
+        rm -f "$STAGE/$_file" "$STATE/manifest.json" "$STATE/manifest.json.sig"
+        rmdir "$STAGE" 2>/dev/null
+        # /boot/update-uimage is removed by the image's ce-ota-finish.
+    else
+        log "after reboot: still build $_now; the update to $_to did not install (see /var/log/ota.log.gz)"
+        put "$STATE/result" "status=InstallFailed
+version=$_title"
+    fi
+    rm -f "$STATE/armed" "$INSTALL_STATUS"
 }
 
-mkdir -p "$DIR"
-log "started (pid $$)"
-refresh_status
-make_offer
-write_diagnostics
-count=0
+# Until the user taps Done, System Updates shows the outcome instead of an offer.
+show_result() {
+    [ -f "$STATE/result" ] || return 1
+    _s=$(sed -n 's/^status=//p' "$STATE/result"); _v=$(sed -n 's/^version=//p' "$STATE/result")
+    put "$OFFER" "{\"status\":\"$(clean "$_s")\",\"version\":\"$(clean "$_v")\",\"networkAvailable\":true,\"checked\":$(date +%s)}"
+    write_status "$_s" "$_v"
+}
+
+# A baked client (the image ships this daemon) removes what a Museum install of
+# OTA Ready left on the rootfs: its backups of the stock System Updates, which
+# would otherwise be "restored" over the image's own copy.
+baked_cleanup() {
+    [ -f /usr/share/otaready/baked ] || return 0
+    _su=/usr/palm/applications/com.palm.app.updates
+    ls "$_su"/app/*.otaready-orig "$_su"/*.otaready-orig >/dev/null 2>&1 || return 0
+    rootfs_rw_begin || return 0
+    rm -f "$_su"/app/*.otaready-orig "$_su"/*.otaready-orig
+    rootfs_rw_end
+    log "removed an older OTA Ready's System Updates backups"
+}
+
+mkdir -p "$DIR" "$STATE"
+chmod 700 "$STATE"
+rm -f "$CMD" "$INSTALL_STATUS"       # nothing is in progress at start
+log "started (pid $$, client $CLIENT_VERSION, build $(buildmark))"
+baked_cleanup
+after_reboot
+show_result || do_check background
+# Wall-clock time, not a count of loop seconds: a sleeping TouchPad does not run
+# this loop, so a counter would stretch a week into months.
+_last=$(date +%s)
+_interval=${_interval:-$CHECK_EVERY}
 while true; do
     if [ -f "$CMD" ]; then
-        c=$(tr -d ' \t\r\n' < "$CMD" 2>/dev/null); rm -f "$CMD"
+        c=$(tr -cd 'a-z' < "$CMD" 2>/dev/null); rm -f "$CMD"
         case "$c" in
-            check)      log "cmd: check";      refresh_status; make_offer; write_diagnostics ;;
-            redirect)   log "cmd: redirect";   apply_patch ;;
-            revert)     log "cmd: revert";     revert_patch ;;
-            install)    log "cmd: install";    do_install ;;
-            reset)      log "cmd: reset-test"; rm -f "$DIR/.installed" "$DIR/install-status.json"; make_offer; write_diagnostics ;;
-            "")         : ;;
-            *)          log "cmd: unknown ($c)" ;;
+            check)   show_result || do_check; _last=$(date +%s) ;;
+            install) do_install ;;
+            ack)     rm -f "$STATE/result" "$INSTALL_STATUS"; do_check; _last=$(date +%s) ;;
+            cancel|"") ;;
+            *)       log "cmd: unknown ($c)" ;;
         esac
     fi
-    count=$((count + 1))
-    if [ "$count" -ge "$REFRESH_EVERY" ]; then refresh_status; make_offer; write_diagnostics; count=0; fi
+    _now=$(date +%s)
+    [ "$_now" -lt "$_last" ] && _last=$_now          # the clock was set back
+    if [ $(( _now - _last )) -ge "$_interval" ]; then
+        [ -f "$STATE/result" ] || do_check background
+        _last=$(date +%s)
+    fi
     sleep 1
 done

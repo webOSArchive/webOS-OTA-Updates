@@ -1,103 +1,135 @@
 #!/bin/sh
-# postinst — runs as ROOT via Preware / WebOS Quick Install (NOT palm-install).
-# Installs the fingerprint helper + root status daemon into system space.
-set -e
+# postinst (OTA Ready v2): runs as root from Preware / App Museum II.
+#
+# Sets up the CE OTA client on a webOS CE 3.1.0-or-later device:
+#   /usr/bin/otaready-daemon, /usr/share/otaready/ota-manifest.js,
+#   /etc/event.d/otaready-daemon, the patched System Updates app, and the
+#   org.webosarchive.otaready.service bridge on the Luna bus.
+#
+# Two cases do no rootfs work:
+#   - an image that bakes the client (/usr/share/otaready/baked): the image's
+#     copy is the one that runs; this package only adds the OTA Ready app.
+#   - a device without CE's trust anchor (not CE 3.1.0+): there is nothing it
+#     could ever be offered. OTAs start at CE 3.1.0; older devices use the Doctor.
 
 APP=/media/cryptofs/apps/usr/palm/applications/org.webosarchive.otaready
+SVC=/media/cryptofs/apps/usr/palm/services/org.webosarchive.otaready.service
+SVCID=org.webosarchive.otaready.service
+SU=/usr/palm/applications/com.palm.app.updates
+DIR=/media/internal/.otaready
+LOCK=/tmp/.ce-rootfs-rw.lock
 
-# --- rootfs write window ---------------------------------------------------
-# On stock 3.0.5 the rootfs is mounted rw, which is why this script used to just
-# remount rw and never look back. On webOS CE 3.1.0 it is mounted READ-ONLY, so
-# leaving it writable afterwards silently removes a protection the image applies.
-# Every rw window is therefore paired with a restore.
-#
-# These three helpers are duplicated from `device/otaready-daemon` because a
-# postinst must be self-contained — the daemon is a long-running script, not
-# something we can source. KEEP THEM IN SYNC with the copies there.
-#
-# GOTCHA: /proc/mounts lists "/" TWICE — the initramfs `rootfs` entry, which is
-# always rw, then the real store-root ext3 that carries the state we care about.
-# Reading the FIRST match reports rw on a read-only device and the restore is
-# then skipped. The effective mount is the LAST one.
+if [ -f /usr/share/otaready/baked ]; then
+    echo "otaready: this image includes the OTA client; only the app was installed"
+    exit 0
+fi
+if [ ! -f /usr/share/ce-ota/keys/ce-ota-signing.pub ] || [ ! -x /usr/bin/ce-ota-verify ]; then
+    # webOS 3.0.5 or older: OTAs start at CE 3.1.0, which these devices reach with
+    # the Doctor. No daemon runs here, so the app's status and the details file
+    # (with the nduid, which the owner sends to be added to a rollout) are written
+    # once, now.
+    echo "otaready: not webOS CE 3.1.0 or later (no update key); updates start at CE 3.1.0" >&2
+    mkdir -p "$DIR"
+    ND=$(tr -cd '0-9a-f' < /proc/nduid 2>/dev/null | cut -c1-40)
+    VER=$(sed -n 's/^PRODUCT_VERSION_STRING=//p' /etc/palm-build-info | tr -cd 'A-Za-z0-9 ._-')
+    BN=$(sed -n 's/^BUILDNAME=//p' /etc/palm-build-info | tr -cd 'A-Za-z0-9 ._-')
+    printf '{"client":2,"offer":"NotEligible","version":"%s","build":"%s","nduid":"%s","time":%s}\n' \
+        "$VER" "$BN" "$ND" "$(date +%s)" > "$DIR/status.json"
+    {
+        echo "webOS Archive OTA Ready diagnostic report (client 2)"
+        echo "Generated: $(date '+%Y-%m-%d %H:%M:%S')"
+        grep -E '^(PRODUCT_VERSION_STRING|BUILDMARK|BUILDNAME)=' /etc/palm-build-info
+        echo "nduid: $ND"
+        echo "Not eligible: updates start at webOS CE 3.1.0"
+    } > "$DIR/diagnostics.txt"
+    rm -f "$DIR/offer.json" "$DIR/install-status.json" "$DIR/server-state.json" "$DIR/test-offer.json" \
+          "$DIR/.installed" "$DIR/arm-install" "$DIR/.last-contact" "$DIR/redirect-result.json" "$DIR/cmd"
+    # OTA Ready 1.x patched System Updates here to read a file nothing updates
+    # now; put the stock app back (3.0.5's rootfs is writable).
+    SUJ=/usr/palm/applications/com.palm.app.updates/app/UpdatesApp.js
+    if [ -f "$SUJ.otaready-orig" ]; then
+        stop otaready-daemon >/dev/null 2>&1
+        mount -o rw,remount / 2>/dev/null
+        mv -f "$SUJ.otaready-orig" "$SUJ"
+        [ -f "$SU/appinfo.json.otaready-orig" ] && mv -f "$SU/appinfo.json.otaready-orig" "$SU/appinfo.json"
+        rm -f /usr/bin/otaready-daemon /usr/bin/ota-fingerprint /usr/bin/ota-direct-update /etc/event.d/otaready-daemon
+        echo "  restored the stock System Updates (OTA Ready 1.x had patched it)"
+    fi
+    exit 0
+fi
+
+# --- rootfs write window: CE mounts / read-only; CE's own lock serialises it.
+# /proc/mounts lists "/" twice; the LAST entry is the real one.
 rootfs_is_ro() {
     _o=$(awk '$2=="/" {o=$4} END {print o}' /proc/mounts 2>/dev/null)
     case ",$_o," in *,ro,*) return 0 ;; esac
     return 1
 }
-
-rootfs_rw_begin() {
-    RO_RESTORE=0
-    rootfs_is_ro || return 0                      # already writable (3.0.5), nothing to do
-    if mount -o rw,remount / 2>/dev/null; then
-        RO_RESTORE=1
-        echo "  rootfs: remounted rw (was ro)"
-        return 0
-    fi
-    return 1
-}
-
-rootfs_rw_end() {
-    [ "${RO_RESTORE:-0}" = 1 ] || return 0
-    sync
-    if mount -o ro,remount / 2>/dev/null; then
-        echo "  rootfs: restored ro"
-    else
-        echo "  rootfs: WARNING — could not restore ro, / is left writable" >&2
-    fi
-    RO_RESTORE=0
-}
-
-# `set -e` is on, so any failure below aborts the script. The EXIT trap is what
-# guarantees the rootfs is still restored on that path — without it, one failed
-# cp would leave / writable forever.
 RO_RESTORE=0
-trap rootfs_rw_end EXIT INT TERM
-
-# Only the /usr/bin and /etc writes below need the window. /media/internal and
-# /var are separate volumes, already writable, and are handled after it closes.
-if ! rootfs_rw_begin; then
-    echo "otaready: ERROR — cannot remount / read-write; aborting install" >&2
-    exit 1
+LOCKED=0
+rw_end() {
+    if [ "$RO_RESTORE" = 1 ]; then
+        sync
+        mount -o ro,remount / 2>/dev/null || echo "otaready: WARNING / left writable" >&2
+        RO_RESTORE=0
+    fi
+    [ "$LOCKED" = 1 ] && rmdir "$LOCK" 2>/dev/null
+    LOCKED=0
+}
+trap rw_end EXIT INT TERM
+n=0
+while ! mkdir "$LOCK" 2>/dev/null && [ $n -lt 60 ]; do sleep 1; n=$((n + 1)); done
+LOCKED=1
+if rootfs_is_ro; then
+    mount -o rw,remount / || { echo "otaready: cannot remount / read-write" >&2; exit 1; }
+    RO_RESTORE=1
 fi
 
-# fingerprint helper (read-only device inspection) + status daemon +
-# direct-update helper (the daemon's install action shells out to it)
-cp "$APP/device/ota-fingerprint" /usr/bin/ota-fingerprint
-cp "$APP/device/otaready-daemon" /usr/bin/otaready-daemon
-cp "$APP/device/direct-update.sh" /usr/bin/ota-direct-update
-chmod 755 /usr/bin/ota-fingerprint /usr/bin/otaready-daemon /usr/bin/ota-direct-update
+stop otaready-daemon >/dev/null 2>&1
 
-# upstart job so the daemon starts on boot
+# v1 leftovers (3.0.5-era fingerprint and direct-update helpers)
+rm -f /usr/bin/ota-fingerprint /usr/bin/ota-direct-update
+
+mkdir -p /usr/share/otaready
+cp "$APP/device/otaready-daemon" /usr/bin/otaready-daemon.new && mv -f /usr/bin/otaready-daemon.new /usr/bin/otaready-daemon
+cp "$APP/device/ota-manifest.js" /usr/share/otaready/ota-manifest.js
 cp "$APP/device/otaready-daemon.conf" /etc/event.d/otaready-daemon
-chmod 644 /etc/event.d/otaready-daemon
+chmod 755 /usr/bin/otaready-daemon
+chmod 644 /usr/share/otaready/ota-manifest.js /etc/event.d/otaready-daemon
 
-# rootfs writes are done — close the window before touching /media and /var
-rootfs_rw_end
-
-# status directory the app reads from (inside the app jail this maps to /media/internal)
-mkdir -p /media/internal/.otaready
-
-# --- JS command-bridge service registration (Luna/LS2) ---------------------
-# The service dir itself ships in the app payload (data.tar.gz) at:
-#   /media/cryptofs/apps/usr/palm/services/org.webosarchive.otaready.service
-# but LS2 role + bus-name files live outside cryptofs and are NOT created by a
-# plain `ipkg install`, so we drop them here (mirrors what the real installer does).
-SVC=/media/cryptofs/apps/usr/palm/services/org.webosarchive.otaready.service
-SVCID=org.webosarchive.otaready.service
-if [ -d "$SVC/ls2" ]; then
-    mkdir -p /var/palm/ls2/roles/prv /var/palm/ls2/roles/pub \
-             /var/palm/ls2/services/prv /var/palm/ls2/services/pub
-    FRESH=1; [ -f /var/palm/ls2/roles/pub/$SVCID.json ] && FRESH=0
-    cp "$SVC/ls2/role.prv.json"        /var/palm/ls2/roles/prv/$SVCID.json
-    cp "$SVC/ls2/role.pub.json"        /var/palm/ls2/roles/pub/$SVCID.json
-    cp "$SVC/ls2/$SVCID.service"       /var/palm/ls2/services/prv/$SVCID
-    cp "$SVC/ls2/$SVCID.service"       /var/palm/ls2/services/pub/$SVCID
-    echo "  registered $SVCID on the Luna bus"
-    [ "$FRESH" = 1 ] && echo "  NOTE: first install — REBOOT once so ls-hubd picks up the new service"
+# System Updates: keep the stock files once (and the build they came from, so
+# prerm never puts an older image's appinfo over a newer one's), install ours,
+# and bump the appinfo version, which is what makes webOS drop its cached copy.
+[ -f "$SU/app/UpdatesApp.js.otaready-orig" ] || cp -p "$SU/app/UpdatesApp.js" "$SU/app/UpdatesApp.js.otaready-orig"
+if [ ! -f "$SU/appinfo.json.otaready-orig" ]; then
+    cp -p "$SU/appinfo.json" "$SU/appinfo.json.otaready-orig"
+    sed -n 's/^BUILDMARK=//p' /etc/palm-build-info > "$SU/appinfo.json.otaready-build"
 fi
+cp "$APP/device/UpdatesApp.patched.js" "$SU/app/UpdatesApp.js"
+chmod 644 "$SU/app/UpdatesApp.js"
+cur=$(sed -n 's/.*"version"[ ]*:[ ]*"\([0-9.]*\)".*/\1/p' "$SU/appinfo.json" | head -1)
+maj=$(echo "$cur" | cut -d. -f1); min=$(echo "$cur" | cut -d. -f2); pat=$(echo "$cur" | cut -d. -f3)
+new="${maj:-1}.${min:-0}.$(( ${pat:-0} + 1 ))"
+sed "s/\"version\"[ ]*:[ ]*\"[0-9.]*\"/\"version\": \"$new\"/" "$SU/appinfo.json" > "$SU/appinfo.json.tmp" &&
+    mv -f "$SU/appinfo.json.tmp" "$SU/appinfo.json"
+echo "  System Updates $cur -> $new (patched)"
 
-# start now so the app has status without waiting for a reboot
-start otaready-daemon 2>/dev/null || echo "otaready-daemon will start on next boot"
+rw_end
 
-echo "otaready: installed helper + daemon + bridge service"
+# --- bridge service on the Luna bus. A plain ipkg install registers no service;
+# these are the files the real installer writes, and ls-control applies them now.
+mkdir -p /var/palm/ls2/roles/prv /var/palm/ls2/roles/pub /var/palm/ls2/services/prv /var/palm/ls2/services/pub
+cp "$SVC/ls2/role.prv.json" /var/palm/ls2/roles/prv/$SVCID.json
+cp "$SVC/ls2/role.pub.json" /var/palm/ls2/roles/pub/$SVCID.json
+cp "$SVC/ls2/$SVCID.service" /var/palm/ls2/services/prv/$SVCID
+cp "$SVC/ls2/$SVCID.service" /var/palm/ls2/services/pub/$SVCID
+ls-control scan-services >/dev/null 2>&1 || echo "  ls-control failed: reboot once so the bridge service is found"
+
+# v1's state and its test switches would mislead v2
+mkdir -p "$DIR"
+rm -f "$DIR/test-offer.json" "$DIR/.installed" "$DIR/arm-install" "$DIR/server-state.json" \
+      "$DIR/redirect-result.json" "$DIR/.last-contact" "$DIR/install-status.json" "$DIR/cmd"
+
+start otaready-daemon >/dev/null 2>&1 || echo "  otaready-daemon starts at the next boot"
+echo "otaready: CE OTA client installed"
 exit 0

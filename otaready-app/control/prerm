@@ -1,23 +1,58 @@
 #!/bin/sh
-# prerm — runs as ROOT before the package is removed. Reverses postinst.
-mount -o rw,remount / 2>/dev/null || true
+# prerm (OTA Ready v2): runs as root before the package is removed. Undoes postinst.
+# On an image that bakes the client it touches nothing: those files are the image's.
 
-stop otaready-daemon 2>/dev/null || true
-
-rm -f /usr/bin/ota-fingerprint
-rm -f /usr/bin/otaready-daemon
-rm -f /usr/bin/ota-direct-update
-rm -f /etc/event.d/otaready-daemon
-
-# LS2 registration for the bridge service (installed by postinst into /var/palm)
 SVCID=org.webosarchive.otaready.service
+SU=/usr/palm/applications/com.palm.app.updates
+DIR=/media/internal/.otaready
+LOCK=/tmp/.ce-rootfs-rw.lock
+
+[ -f /usr/share/otaready/baked ] && exit 0
+
+stop otaready-daemon >/dev/null 2>&1
+
+rootfs_is_ro() {
+    _o=$(awk '$2=="/" {o=$4} END {print o}' /proc/mounts 2>/dev/null)
+    case ",$_o," in *,ro,*) return 0 ;; esac
+    return 1
+}
+n=0
+while ! mkdir "$LOCK" 2>/dev/null && [ $n -lt 60 ]; do sleep 1; n=$((n + 1)); done
+RO=0
+if rootfs_is_ro; then mount -o rw,remount / 2>/dev/null && RO=1; fi
+
+rm -f /usr/bin/otaready-daemon /etc/event.d/otaready-daemon
+rm -rf /usr/share/otaready
+rm -f /usr/bin/ota-fingerprint /usr/bin/ota-direct-update        # v1
+
+# System Updates back to stock. The appinfo backup is put back only on the build
+# it was taken from: after an OTA the image's own (newer) appinfo stays, with a
+# version bump so the stock JS is loaded instead of the cached patched copy.
+if [ -f "$SU/app/UpdatesApp.js.otaready-orig" ]; then
+    mv -f "$SU/app/UpdatesApp.js.otaready-orig" "$SU/app/UpdatesApp.js"
+fi
+if [ -f "$SU/appinfo.json.otaready-orig" ]; then
+    if [ "$(cat "$SU/appinfo.json.otaready-build" 2>/dev/null)" = "$(sed -n 's/^BUILDMARK=//p' /etc/palm-build-info)" ]; then
+        mv -f "$SU/appinfo.json.otaready-orig" "$SU/appinfo.json"
+    else
+        rm -f "$SU/appinfo.json.otaready-orig"
+        cur=$(sed -n 's/.*"version"[ ]*:[ ]*"\([0-9.]*\)".*/\1/p' "$SU/appinfo.json" | head -1)
+        maj=$(echo "$cur" | cut -d. -f1); min=$(echo "$cur" | cut -d. -f2); pat=$(echo "$cur" | cut -d. -f3)
+        sed "s/\"version\"[ ]*:[ ]*\"[0-9.]*\"/\"version\": \"${maj:-1}.${min:-0}.$(( ${pat:-0} + 1 ))\"/" "$SU/appinfo.json" > "$SU/appinfo.json.tmp" &&
+            mv -f "$SU/appinfo.json.tmp" "$SU/appinfo.json"
+    fi
+    rm -f "$SU/appinfo.json.otaready-build"
+fi
+
+if [ "$RO" = 1 ]; then sync; mount -o ro,remount / 2>/dev/null; fi
+rmdir "$LOCK" 2>/dev/null
+
 rm -f /var/palm/ls2/roles/prv/$SVCID.json /var/palm/ls2/roles/pub/$SVCID.json
 rm -f /var/palm/ls2/services/prv/$SVCID /var/palm/ls2/services/pub/$SVCID
+ls-control scan-services >/dev/null 2>&1
 
-# leave the last status.json (harmless, user-visible); clear only the control channel + state
-rm -f /media/internal/.otaready/cmd /media/internal/.otaready/redirect-result.json
-rm -f /media/internal/.otaready/install-status.json /media/internal/.otaready/server-state.json
-rm -f /media/internal/.otaready/.last-contact /media/internal/.otaready/.installed
-
-echo "otaready: removed helper + daemon"
+# The download (if any) and the daemon's state. status.json stays: harmless.
+rm -rf /var/lib/otaready /media/internal/ce-ota
+rm -f "$DIR/cmd" "$DIR/offer.json" "$DIR/install-status.json"
+echo "otaready: CE OTA client removed"
 exit 0

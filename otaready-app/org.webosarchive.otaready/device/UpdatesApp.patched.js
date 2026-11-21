@@ -101,7 +101,11 @@ enyo.kind({
         // daemon then runs the direct-update flow.
         {name: "otareadyTrigger", kind: enyo.PalmService,
             service: "palm://org.webosarchive.otaready.service/", method: "trigger",
-            onSuccess: "otareadyTriggerOk", onFailure: "otareadyTriggerFail"}
+            onSuccess: "otareadyTriggerOk", onFailure: "otareadyTriggerFail"},
+        // check / cancel / ack: same bridge, no install bookkeeping on the answer
+        {name: "otareadyCmd", kind: enyo.PalmService,
+            service: "palm://org.webosarchive.otaready.service/", method: "trigger",
+            onSuccess: "handleGenericSuccess", onFailure: "otareadyCmdFail"}
     ],
 
     create: function() {
@@ -125,10 +129,12 @@ enyo.kind({
         }
             
         this.log("create info component");        
+        // OTAREADY: battery level is wanted outside first use too: Install Now is
+        // refused below OTAREADY_MIN_BATTERY, as the stock daemon did.
+        this.currentBatteryPercent = undefined;
+        this.$.signalAddMatch.call({"category":"/com/palm/power","method":"batteryStatus"});
+        this.$.batteryStatus.call({});
         if (this.firstUse) {
-            this.currentBatteryPercent = undefined;
-            this.$.signalAddMatch.call({"category":"/com/palm/power","method":"batteryStatus"});
-            this.$.batteryStatus.call({});
 
             this.createComponents(this.firstUseDisplay);
             this.$.updateNowButton.setCaption(this.label_button_now);
@@ -154,7 +160,9 @@ enyo.kind({
             this.$.cmGetStatus.call();
             // OTAREADY: do NOT subscribe to the UpdateDaemon status — it would push the real
             // daemon's "UpToDate" over our offer. We drive payload from offer.json instead.
-            this.checkForUpdate();
+            // If the daemon is already installing (the app was closed and reopened),
+            // follow that instead of checking.
+            this.otareadyResumeOrCheck();
         }
     },
 
@@ -170,30 +178,71 @@ enyo.kind({
             if (this.$.releaseNotes) {
                 this.$.releaseNotes.setChecking();
             }
-            // OTAREADY: read the community server's offer written by otaready-daemon,
-            // instead of the carrier-gated palm://com.palm.update/CheckForUpdate.
-            // Plain XMLHttpRequest + JSON.parse (this Enyo build's enyo.xhr/enyo.json
-            // have a different signature and threw during create(), blanking the app).
+            // OTAREADY: instead of the carrier-gated palm://com.palm.update/CheckForUpdate,
+            // ask otaready-daemon to check (it verifies the signed manifest) and show
+            // the offer.json it writes. Note the old file's "checked" time, send the
+            // command, and wait for a newer file (or give up and show what is there).
             var self = this;
-            var req = new XMLHttpRequest();
-            req.onreadystatechange = function() {
-                if (req.readyState != 4) { return; }
-                self.systemCheckInProgress = false;
-                var p;
-                try { p = JSON.parse(req.responseText); }
-                catch(e) { p = {status: "UpToDate", networkAvailable: true}; }
-                self.setPayload(p);
-            };
-            try {
-                req.open("GET", "file:///media/internal/.otaready/offer.json?t=" + (new Date()).getTime(), true);
-                req.send(null);
-            } catch(e) {
-                self.systemCheckInProgress = false;
-                self.setPayload({status: "UpToDate", networkAvailable: true});
-            }
+            this.otareadyRead("offer.json", function(old) {
+                var before = (old && old.checked) || 0;
+                self.otareadyCheckWaits = 0;
+                self.otareadyCheckBefore = before;
+                self.$.otareadyCmd.call({cmd: "check"});
+                self.otareadyWaitForOffer();
+            });
         } else{
             this.log("Check already in progress");
         }
+    },
+
+    // OTAREADY: raw XHR of a daemon file (this Enyo build's enyo.xhr/enyo.json have a
+    // different signature and threw during create(), blanking the app).
+    otareadyRead: function(name, done) {
+        var req = new XMLHttpRequest();
+        req.onreadystatechange = function() {
+            if (req.readyState != 4) { return; }
+            var v = null;
+            try { v = JSON.parse(req.responseText); } catch (e) { v = null; }
+            done(v);
+        };
+        try {
+            req.open("GET", "file:///media/internal/.otaready/" + name + "?t=" + (new Date()).getTime(), true);
+            req.send(null);
+        } catch (e) {
+            done(null);
+        }
+    },
+
+    otareadyWaitForOffer: function() {
+        var self = this;
+        this.otareadyRead("offer.json", function(p) {
+            var fresh = p && p.checked && p.checked != self.otareadyCheckBefore;
+            if (!fresh && self.otareadyCheckWaits < 45) {
+                self.otareadyCheckWaits++;
+                setTimeout(function() { self.otareadyWaitForOffer(); }, 1000);
+                return;
+            }
+            self.systemCheckInProgress = false;
+            self.setPayload(p || {status: "UpToDate", networkAvailable: true});
+        });
+    },
+
+    otareadyResumeOrCheck: function() {
+        var self = this;
+        this.otareadyRead("install-status.json", function(st) {
+            var s = st && st.status;
+            if (s == "preparing" || s == "downloading" || s == "verifying" || s == "rebooting") {
+                self.otareadyRequested = 0;
+                self.otareadyRead("offer.json", function(p) {
+                    self.otareadyOffer = p || {};
+                    self.payload = p || {status: "Available"};
+                    self.otareadyInstalling = true;
+                    self.applyInstallStatus(st);
+                });
+            } else {
+                self.checkForUpdate();
+            }
+        });
     },
 
     payloadChanged: function(){
@@ -472,6 +521,11 @@ enyo.kind({
 
     cancelDownloadClick: function(){
         this.log();
+        if (this.otareadyInstalling) {
+            // OTAREADY: the daemon stops the download and keeps what it has.
+            this.$.otareadyCmd.call({cmd: "cancel"});
+            return;
+        }
         this.cancelDownload = true;
         this.$.cancelDownload.call();        
     },
@@ -484,7 +538,9 @@ enyo.kind({
         }
 
         if(this.payload.status == "InstallSuccessful" || this.payload.status == "InstallFailed"){
-            window.close();
+            // OTAREADY: the daemon shows the result until it is acknowledged.
+            this.$.otareadyCmd.call({cmd: "ack"});
+            setTimeout(function() { window.close(); }, 500);
         } else if ( (this.payload.status == 'Downloading') || 
                     (this.payload.status == 'Waiting') || 
                     (this.payload.status == 'NetworkFailed')) {
@@ -514,6 +570,12 @@ enyo.kind({
     // ramdisk). We reflect the daemon's install-status.json back into the native UI.
     otareadyInstall: function() {
         this.log("OTAREADY install requested -> daemon via service");
+        var MIN = 50;                   // OTAREADY_MIN_BATTERY, percent
+        if (this.currentBatteryPercent !== undefined && this.currentBatteryPercent < MIN) {
+            this.setPayload({status: "InsufficientCharge", minBattery: MIN / 100,
+                             version: this.payload.version});
+            return;
+        }
         this.otareadyInstalling = true;
         // remember the full offer (version/size/installTime) — the daemon's status
         // updates don't carry it, and dropping installTime renders "about undefined
@@ -523,7 +585,17 @@ enyo.kind({
         this.setPayload({status: "Downloading", version: this.payload.version,
                          size: this.payload.size, installTime: this.payload.installTime,
                          networkAvailable: true});
+        // install-status.json from an earlier attempt is ignored: only a status
+        // the daemon wrote after this moment counts (its "t", same clock).
+        this.otareadyRequested = Math.floor(new Date().getTime() / 1000) - 1;
         this.$.otareadyTrigger.call({cmd: "install"});
+    },
+
+    otareadyCmdFail: function(inSender, inResponse) {
+        // The bridge is not on the bus: nothing will answer. Show what the daemon
+        // last wrote rather than spinning for 45 s.
+        this.log("otaready cmd fail: " + JSON.stringify(inResponse));
+        this.otareadyCheckWaits = 45;
     },
 
     otareadyTriggerOk: function(inSender, inResponse) {
@@ -559,29 +631,40 @@ enyo.kind({
     },
 
     applyInstallStatus: function(st) {
+        if (st && this.otareadyRequested && !(st.t >= this.otareadyRequested)) {
+            st = null;                  // left over from an earlier attempt
+        }
         var s = st && st.status;
-        if (s == "installing") {
-            // armed: device is about to build the uimage and reboot into the updater
-            this.setPayload({status: "Downloading", version: this.payload.version,
-                             installTime: this.otareadyOffer && this.otareadyOffer.installTime,
+        var offer = this.otareadyOffer || {};
+        var pct = (st && st.percent) || 0;
+        if (s == "preparing" || s == "downloading" || s == "verifying" || s == "rebooting") {
+            // 0-40 download, 41-44 checks, 45 = about to restart into the updater
+            // (the stock bar reads "unpacking" from 45).
+            this.otareadyInstalling = true;
+            this.setPayload({status: "Downloading", percent: pct, version: offer.version,
+                             size: offer.size, installTime: offer.installTime,
                              networkAvailable: true});
             this.pollLater();
-        } else if (s == "preparing") {
-            this.pollLater();
-        } else if (s == "prepared") {
-            // payload delivered — the daemon has flipped the offer to UpToDate, so settle
-            // into the "no more updates" state instead of looping back to the offer.
+        } else if (s == "spaceneeded") {
             this.otareadyInstalling = false;
-            this.log("otaready install prepared (delivered): " + JSON.stringify(st));
-            this.setPayload({status: "UpToDate", networkAvailable: true});
+            this.setPayload({status: "SpaceNeeded", spaceNeeded: st.spaceNeeded,
+                             version: offer.version});
+        } else if (s == "cancelled") {
+            this.otareadyInstalling = false;
+            offer.status = "Available";
+            this.setPayload(offer);
+        } else if (s == "failed") {
+            this.otareadyInstalling = false;
+            // The stock text is "...#{version}..."; the reason rides along so the
+            // user sees why without a log.
+            this.setPayload({status: "InstallFailed",
+                             version: (offer.version || "the update") +
+                                      (st.reason ? " (" + enyo.string.escapeHtml(st.reason) + ")" : "")});
         } else if (s == "uptodate") {
             this.otareadyInstalling = false;
             this.setPayload({status: "UpToDate", networkAvailable: true});
-        } else if (s == "failed") {
-            this.otareadyInstalling = false;
-            this.setPayload({status: "InstallFailed", version: this.payload.version});
         } else {
-            // no status file yet — keep waiting
+            // no status file yet: the daemon has not picked the command up
             this.pollLater();
         }
     },

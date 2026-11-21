@@ -25,6 +25,7 @@ from syncml.builder import StatusBuilder, ItemBuilder
 from syncml.parser import SyncMLMessage
 from dm import DMTree, UpdateManager
 from dm.eligibility import resolve as resolve_eligibility, parse_oneline, load_policy
+import ce_ota
 
 # Configure logging
 logging.basicConfig(
@@ -49,6 +50,8 @@ app = FastAPI(
     version="1.0.0"
 )
 
+app.include_router(ce_ota.router)
+
 # Initialize components
 session_manager = SessionManager(session_timeout=config.SESSION_TIMEOUT)
 update_manager = UpdateManager(config.PACKAGES_DIR)
@@ -68,6 +71,10 @@ def _endpoint_bucket(path: str) -> str:
     """Group per-package download paths so stats don't explode."""
     if path.startswith("/packages/"):
         return "/packages/*"
+    if path.startswith("/api/ce-ota/payloads/"):
+        return "/api/ce-ota/payloads/*"
+    if path.startswith("/api/ce-ota/manifests/"):
+        return "/api/ce-ota/manifests/*"
     return path
 
 
@@ -101,9 +108,9 @@ class Metrics:
             c["build"] = build           # real device build, from /check?build=
         if baseline:
             c["baseline"] = baseline      # eligibility baseline, from /plan?baseline=
-        if path.startswith("/api/updates/check"):
+        if path.startswith("/api/updates/check") or path.startswith("/api/ce-ota/check"):
             c["checks"] += 1
-        if path.startswith("/packages/"):
+        if path.startswith("/packages/") or path.startswith("/api/ce-ota/payloads/"):
             c["downloads"] += 1
         self.recent.appendleft({
             "t": int(time.time()), "method": method, "path": path,

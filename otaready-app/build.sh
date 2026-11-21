@@ -7,23 +7,19 @@ set -e
 
 APPID=org.webosarchive.otaready
 SVCID=org.webosarchive.otaready.service
-VERSION=1.2.0
+VERSION=$(sed -n 's/.*"version"[ ]*:[ ]*"\([0-9.]*\)".*/\1/p' "$(cd "$(dirname "$0")" && pwd)/org.webosarchive.otaready/appinfo.json")
 HERE=$(cd "$(dirname "$0")" && pwd)
 APPDIR="$HERE/$APPID"
 SVCDIR="$HERE/$SVCID"
-FINGERPRINT="$HERE/../webos-update-server/device-scripts/fingerprint.sh"
-DIRECTUPDATE="$HERE/../webos-update-server/device-scripts/direct-update.sh"
 OUT="$HERE/${APPID}_${VERSION}_all.ipk"
 
-[ -f "$FINGERPRINT" ] || { echo "ERROR: fingerprint.sh not found at $FINGERPRINT"; exit 1; }
-[ -f "$DIRECTUPDATE" ] || { echo "ERROR: direct-update.sh not found at $DIRECTUPDATE"; exit 1; }
+for f in otaready-daemon otaready-daemon.conf ota-manifest.js UpdatesApp.patched.js; do
+    [ -f "$APPDIR/device/$f" ] || { echo "ERROR: device/$f missing"; exit 1; }
+done
+sh -n "$APPDIR/device/otaready-daemon" || { echo "ERROR: otaready-daemon does not parse"; exit 1; }
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-
-# 1. sync canonical device scripts into the bundle (single source of truth)
-cp "$FINGERPRINT"   "$APPDIR/device/ota-fingerprint"
-cp "$DIRECTUPDATE"  "$APPDIR/device/direct-update.sh"
 
 # 2. stage the data root. OFFLINE-ROOT RULE: data.tar.gz is rooted at
 #    ./usr/palm/{applications,services}/<id>/... (the installer extracts it under
@@ -45,7 +41,7 @@ Priority: optional
 Architecture: all
 Installed-Size: 1
 Maintainer: webOS Archive
-Description: Get Ready for OTA - checks OTA eligibility and (soon) repoints the device at the community update server.
+Description: OTA Ready - lets System Updates install webOS CE updates from the community update server (webOS CE 3.1.0 and later).
 webOS-Package-Format-Version: 2
 webOS-Packager-Version: 3.0.5b38
 CTRL

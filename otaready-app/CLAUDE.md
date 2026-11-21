@@ -1,6 +1,51 @@
-# CLAUDE.md — "Get Ready for OTA" app + System Updates reroute
+# CLAUDE.md — OTA Ready (CE OTA client) + System Updates
 
 Resume-here notes for this sub-project. Read this first.
+
+## v3.0.0 (2026-11-21): the CE OTA client, webOS CE 3.1.0 onward
+
+OTAs start at CE 3.1.0 (community decision: 3.0.5 -> 3.1.0 is a Doctor flash). v3.0.0
+replaces everything 3.0.5-specific below (fingerprint, baselines A-H, redirect button,
+direct-update.sh, the arm-install switch). **Proven on hardware 2026-11-21:** device C
+went 600070 -> 600119 (3.2.0) from System Updates' Install Now, through the stock
+ramdisk, and came back "installed"; ce-ota-finish "finished and verified".
+
+- **Daemon** `device/otaready-daemon` (root, `/usr/bin`, upstart `start on stopped finish`,
+  not tied to Luna). Commands via the bridge: `check | install | cancel | ack`.
+  - check: `GET /api/ce-ota/check?build=<BUILDMARK>&nduid=<id>` -> fetch
+    `manifests/<name>.json` + `.sig` -> `/usr/bin/ce-ota-verify` with the baked key ->
+    `device/ota-manifest.js` (node 0.4, strict, emits shell vars) -> device-side gates:
+    from-buildmark == this build, pre-flight md5sums file matches, stock kernel. Then
+    `offer.json`. Background check at boot and weekly (wall clock); the first time a
+    background check finds a release it opens System Updates (as stock UpdateDaemon did).
+  - install: first use done, no ce-* job running, space on /media/internal and on / (the
+    manifest's `space`), download to `/media/internal/ce-ota/` (resumable, cancel keeps the
+    part), sha256, session files in PmUpdater's format, `PmUpdater -v`, re-hash, arm
+    (`updating`, make-update-uimage, check the uImage link), reboot. `STATE/armed` + the
+    build after the reboot decide InstallSuccessful/InstallFailed, shown until Done (`ack`).
+  - Bench switches in `/media/internal/.otaready/`: `dry-run` (all steps but arming),
+    `server-url` (another server; manifests still need the key).
+  - busybox sh arithmetic is 32-bit and dies on overflow: all space math is in KB.
+- **System Updates** (`device/UpdatesApp.patched.js`): Check Now asks the daemon and waits
+  for a newer offer.json; progress 0-40 download, 41-44 checks, 45 restart; SpaceNeeded,
+  InsufficientCharge (< 50 %), failure reasons, Cancel, Done -> ack.
+- **App** (`source/MainView.js`): status, Device Details incl. **NDUID** (owners send it to
+  be added to a rollout), Save/Send Device Details. On 3.0.5 the postinst writes
+  "Not eligible" + a docs.webosarchive.org pointer and restores a 1.x-patched System Updates.
+- **postinst/prerm**: patch System Updates (backup + appinfo version bump), bridge
+  registered live with `ls-control scan-services` (no reboot). prerm restores appinfo only
+  on the build it was saved from. **Baking:** an image with `/usr/share/otaready/baked`
+  ships its own client; the Museum package then leaves the rootfs alone.
+- **Server** (`../webos-update-server/ce_ota.py`): one endpoint; `ce-ota/releases.json`
+  sets the blast radius per release (`"devices": "*"` or a list of nduids). Manifests are
+  signed with `tools/sign-manifest.py` (key in `../keys/`, never committed); payloads live
+  in `[ce_ota] payload_dir` (default `ce-ota/payloads/`, git-ignored, copied by hand).
+  `tools/bench-server.py`: stdlib LAN stand-in using the same selection code.
+- Payloads come from webos-doctor-ce `build/ota/make-payload.py` (see its Docs/OTA-HANDOFF.md).
+
+Everything below this line is the 3.0.5-era history (v1.x), kept for reference.
+
+---
 
 ## What this is
 
