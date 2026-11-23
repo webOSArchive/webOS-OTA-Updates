@@ -11,38 +11,30 @@ update ramdisk is built and booted, and how to recover a device that gets stuck 
 | Document | What it covers | Read it when |
 |----------|----------------|--------------|
 | **This document** | The OTA mechanism itself: building IPKs, session files, `make-update-uimage`, the update ramdisk, recovery | You need to know how the flash actually works, or something failed during one |
-| **`OTA-3.1.0.md`** | Everything for webOS **CE 3.1.0**: trust model, what the image bakes, required client changes, validation, runbook | Working on the community OS release or the system image |
-| **`OTA-3.0.5.md`** | Everything for stock **webOS 3.0.5**: the heterogeneous field population, the OTA Ready bootstrapper, TLS constraints. Plus the abandoned OMA-DM research | Shipping to devices that have not been reflashed |
-| `Update Baselines.md` | The A–H device baseline matrix and L/T/Q axes | Interpreting a device fingerprint |
+| **`OTA-3.1.0.md`** | The September 2026 design for CE OTA: trust model, signing key, what the image bakes | The key or the trust model |
 | `webos-update-server/DEPLOY.md` | Deploying and configuring the update server | Standing up or moving the server |
-| `otaready-app/CLAUDE.md` | The OTA Ready app: architecture and hard-won on-device lessons | Working on the app or its daemon |
+| `otaready-app/CLAUDE.md` | The OTA Ready client: daemon, install flow, on-device lessons | Working on the client |
 | `keys/README.md` | The CE OTA signing key, its algorithm and fingerprint | Anything involving payload signing |
+| `../webos-doctor-ce/Docs/OTA-HANDOFF.md` | Where CE OTA stands; payloads; the armed-flash runbook | Releasing an update |
 
-**Consolidated 2026-08-30.** `OTA-IMAGE-INTEGRATION.md`, `IMAGE-SIDE-DECISIONS.md` and
-`howto-ota-3.1.0.md` merged into `OTA-3.1.0.md`; `howto-ota-3.0.5.md` and `plan.md`
-merged into `OTA-3.0.5.md`. Those five files are gone — edit the merged documents.
+The 3.0.5-era documents (`OTA-3.0.5.md`, `Update Baselines.md`) and the OMA DM server were
+removed on 2026-11-23: OTAs start at CE 3.1.0. They are in git history.
 
 ---
 
 ## Where the project stands
 
-- The delivery chain is proven end to end on hardware **except the final armed flash**.
-- Payload **signing is designed and the key is baked into 3.1.0, but the daemon does
-  not verify anything yet.** Until it does, an OTA is an unauthenticated root code
-  path — do not ship one to users.
-- There is **no real payload**; the server hosts test packages and a placeholder offer.
-  **A first candidate now exists** (2026-09-04): a one-file fix for the USB Settings
-  "Helper not running" defect on CE 3.1.0. It is small, benign and needs no ramdisk —
-  see `OTA-3.1.0.md` Part VII, open item #5.
-
-Full status in `OTA-3.1.0.md` (Part VII) and `OTA-3.0.5.md` §7.
+CE OTA is in production: OTA Ready 3.x from App Museum II takes a CE 3.1.0 device to
+3.2.0 through System Updates' Install Now, with signed manifests and a per-release device
+filter. Payloads are rootfs deltas built by `make-payload.py` in `../webos-doctor-ce`.
+Current state and next steps: that project's `Docs/OTA-HANDOFF.md`.
 
 ---
 
 # The OTA mechanism
 
-The rest of this document explains how to create, stage, and deploy OTA updates to an
-HP TouchPad running webOS 3.0.5. **The same mechanism is used on CE 3.1.0** — the
+The rest of this document explains how an OTA is staged and flashed on an HP TouchPad.
+It was worked out on webOS 3.0.5; **the same mechanism is used on CE 3.1.0 and later** — the
 `ota-scripts`, session files and update ramdisk are unchanged there, confirmed present
 and untouched in the 3.1.0 image.
 
@@ -205,7 +197,7 @@ Always stage to a temporary file on the same filesystem and `mv` into place.
 ### Two ordering accidents worth knowing
 
 1. **`updatefsinfo` is first by luck, not by rule.**
-   `direct-update.sh:create_session_files` orders the package list with
+   The 1.x helper `direct-update.sh:create_session_files` (removed; in git history) ordered the package list with
    `sort -r`, so `updatefsinfo` lands first only because `u` sorts after `c`. A
    package named later in the alphabet would silently displace it and fail
    `make-update-uimage`. This deserves an explicit ordering rule before the

@@ -1,5 +1,12 @@
 # OTA on webOS CE 3.1.0
 
+> **Read first (2026-11-23).** This is the September 2026 design. The trust model and the
+> signing key (Parts I-II) still hold. The client and server described here (fingerprint,
+> `offer.json`, `/api/updates/*`, `direct-update.sh`) were replaced by OTA Ready 3.x and
+> `ce_ota.py`, and the 3.0.5 material it points to (`OTA-3.0.5.md`) was removed; both are
+> in git history. Current state: `otaready-app/CLAUDE.md` and
+> `../webos-doctor-ce/Docs/OTA-HANDOFF.md`.
+
 **The single reference for getting a community OTA onto a device running webOS CE
 3.1.0** — the trust model, what the system image bakes, the changes required of the
 on-device client, the validation criteria, and the human runbook.

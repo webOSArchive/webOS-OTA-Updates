@@ -1,9 +1,8 @@
-# Deploying the webOS Community Update Server
+# Deploying the webOS CE update server
 
 Target host: **`swupdate.webosarchive.org`** — matches Palm's original OTA update
-subdomain (`omadm.swupdate.palm.com`). Devices are pointed at this host by the
-OTA Ready (Beta) app; it does not replace Palm's DNS, it stands in for a server
-that no longer exists.
+subdomain (`omadm.swupdate.palm.com`). OTA Ready 3.x on webOS CE 3.1.0 and later
+asks it for updates (`/api/ce-ota/*`, see `ce_ota.py`).
 
 ## 1. Runtime
 
@@ -36,10 +35,9 @@ first found wins, missing file → built-in defaults:
 host = 0.0.0.0        # bind 127.0.0.1 in prod (proxy faces the public interface)
 port = 8080
 debug = false
-session_timeout = 3600
 
 [public]
-# Public hostname for the download URLs handed to devices.
+# Public hostname, reported by /health (manifests carry relative payload URLs).
 # Blank -> auto-detect this host's LAN IP (local dev).
 host = swupdate.webosarchive.org
 # url = https://…       # optional full override; wins over host
@@ -48,8 +46,7 @@ host = swupdate.webosarchive.org
 file = /var/log/webos-update-server.log   # blank -> stdout / journald only
 ```
 
-With `[public] host`/`url` blank, download URLs auto-detect the LAN IP (dev). Set
-`host` for production so URLs resolve publicly. Verify what will be served:
+Verify what the server will report:
 
 ```bash
 .venv/bin/python -c "import config; print(config.CONF_PATH, config.SERVER_URL)"
@@ -62,7 +59,7 @@ Put the production settings in `/etc/otaserver.conf` (see §2), then
 
 ```ini
 [Unit]
-Description=webOS Community Update Server
+Description=webOS CE update server
 After=network.target
 
 [Service]
@@ -86,7 +83,7 @@ The `--host`/`--port` on the ExecStart line are uvicorn's bind (keep them on
 ## 4. Reverse proxy + TLS
 
 The point of this whole project is modern TLS on old TouchPads, so serve HTTPS.
-Target devices are `READY` (they already have the TLS 1.3 suite), so a modern
+CE 3.1.0 and later ship the TLS 1.3 suite, so a modern
 Let's Encrypt cert is reachable by them.
 
 **Caddy** (automatic certs) — `/etc/caddy/Caddyfile`:
@@ -106,10 +103,10 @@ DNS: an `A` record for `swupdate.webosarchive.org` → the host's public IP.
 ## 5. Health & logging
 
 - **`GET /health`** — liveness for uptime monitors: status, uptime, version,
-  `public_url`, package count, `requests_total`, `unique_clients`, `errors`.
-- **`GET /api/stats`** — beta health: traffic by endpoint, status-code counts,
-  per-device rows (ip, build, baseline, checks, downloads, last-seen), recent requests.
-- **`LOG_FILE`** — rotating access log; each request logs `ACCESS <ip> <method> <path> -> <status> [build/baseline]`.
+  `public_url`, `requests_total`, `unique_clients`, `errors`.
+- **`GET /api/stats`** — traffic by endpoint, status-code counts,
+  per-device rows (ip, build, checks, downloads, last-seen), recent requests.
+- **`[logging] file`** — rotating access log; each request logs `ACCESS <ip> <method> <path> -> <status> [build]`.
 
 Quick check once live:
 
@@ -122,13 +119,11 @@ curl -s https://swupdate.webosarchive.org/api/stats | python3 -m json.tool
 > behind a trusted proxy, but put them behind basic-auth or an allowlist if the
 > host is public and you consider that sensitive.
 
-## 6. Point a device at it
+## 6. Point a device somewhere else
 
-On the TouchPad (OTA Ready daemon reads this):
+OTA Ready uses `https://swupdate.webosarchive.org` unless the device has an override,
+for a bench server on the LAN (`tools/bench-server.py`):
 
 ```bash
-echo "https://swupdate.webosarchive.org" > /media/internal/.otaready/server-url
+echo "http://<host>:8765" > /media/internal/.otaready/server-url   # remove it afterwards
 ```
-
-Absent that file, the daemon falls back to its compiled-in default. For the LAN
-demo we used `http://<dev-ip>:8080`.
