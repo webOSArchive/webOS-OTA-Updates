@@ -18,6 +18,7 @@ The payloads themselves are built and proven in the webOS CE Doctor project
 | `webos-update-server/device-scripts/ce-ota-verify` | The on-device signature check baked into the CE image |
 | `otaready-app/` | OTA Ready 3.x, the client (App Museum II). Read its `CLAUDE.md` first |
 | `keys/` | The public signing key, the trust anchor baked into the image. The private key is never committed |
+| `HOW-IT-WORKS.md` | An OTA from start to finish, and what we had to figure out. Start here if you're curious |
 | `OTA-UPDATE-GUIDE.md` | How a flash works on the device: session files, the update ramdisk, recovery from a stuck update |
 | `OTA-3.1.0.md` | The September 2026 design for CE OTA (trust model, key, image side) |
 
