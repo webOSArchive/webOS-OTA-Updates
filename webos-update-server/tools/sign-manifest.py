@@ -8,7 +8,9 @@ Writes ce-ota/manifests/<from>-<to>.json and .json.sig (base64 of an RSA-4096
 SHA-256 PKCS#1 v1.5 signature: what /usr/bin/ce-ota-verify on the device checks),
 then verifies the pair with the public key before exiting. --copy-payload also
 copies the ipk (found next to manifest-inputs.json, sha256 checked) into
-ce-ota/payloads/ for a local server; production gets it by hand.
+ce-ota/payloads/ for a local server; production gets it by hand. On a server the
+ipk is named <from>-<to>_<payload.file> (the manifest's url says so); manifests
+signed before 2026-11-23 name the bare payload.file.
 
 Signing needs keys/ce-ota-signing.key (never committed). Writing the manifest
 offers nothing to anyone: ce-ota/releases.json decides who sees it.
@@ -65,6 +67,11 @@ def main():
             sys.exit("payload next to the inputs does not match them: %s" % got)
 
     name = "%s-%s" % (mi["from"]["buildmark"], mi["to"]["buildmark"])
+    # The ipk is named after its target build alone, so two payloads to the same
+    # build (600070-600120 and 600119-600120) share a file name. On the server each
+    # is stored under its manifest's name; the device still stages and installs it
+    # as payload.file, the package name the OTA path has always used.
+    served = "%s_%s" % (name, mi["payload"]["file"])
     manifest = {
         "format": FORMAT,
         "name": name,
@@ -76,7 +83,7 @@ def main():
             "file": mi["payload"]["file"],
             # Relative: resolved against the server the device asked, so a host move
             # needs no re-signing. The sha256 is what makes the bytes trustworthy.
-            "url": "/api/ce-ota/payloads/" + mi["payload"]["file"],
+            "url": "/api/ce-ota/payloads/" + served,
             "size": mi["payload"]["size"],
             "sha256": mi["payload"]["sha256"],
             "md5": mi["payload"]["md5"],
@@ -114,8 +121,8 @@ def main():
         if not os.path.exists(ipk):
             sys.exit("no payload at %s" % ipk)
         os.makedirs(PAYLOADS, exist_ok=True)
-        shutil.copyfile(ipk, os.path.join(PAYLOADS, mi["payload"]["file"]))
-        print("copied the payload to %s" % PAYLOADS)
+        shutil.copyfile(ipk, os.path.join(PAYLOADS, served))
+        print("copied the payload to %s" % os.path.join(PAYLOADS, served))
     print("offered to nobody until ce-ota/releases.json names %s" % name)
 
 

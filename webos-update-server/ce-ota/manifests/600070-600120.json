@@ -1,0 +1,32 @@
+{
+ "format": 1,
+ "from": {
+  "buildmark": "600070",
+  "version": "webOS CE 3.1.0"
+ },
+ "name": "600070-600120",
+ "offer": {
+  "installMinutes": 10,
+  "title": "webOS CE 3.2.0 Beta 2 (600120)"
+ },
+ "payload": {
+  "file": "org.webosarchive.ce-ota-3.2.0_600120_all.ipk",
+  "md5": "db7c44a78d994849cde4b18663b1f4e3",
+  "sha256": "20a8c5ff6e921e2b54ba494bd61f605f0ccf2b12173f9bd18d12f5620550fa3e",
+  "size": 51891826,
+  "url": "/api/ce-ota/payloads/600070-600120_org.webosarchive.ce-ota-3.2.0_600120_all.ipk"
+ },
+ "preflight": {
+  "md5": "adb25d87c7a8070b90c84bcc0b3b6777",
+  "path": "/usr/lib/ipkg/info/org.webosarchive.ce-files.md5sums"
+ },
+ "space": {
+  "largest_file": 12833057,
+  "rootfs_growth": 58090969
+ },
+ "tier": "armed-flash",
+ "to": {
+  "buildmark": "600120",
+  "version": "webOS CE 3.2.0"
+ }
+}
