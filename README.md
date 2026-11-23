@@ -34,7 +34,7 @@ The payloads themselves are built and proven in the webOS CE Doctor project
    ```json
    {"releases": [
      {"manifest": "600070-600120", "devices": ["<nduid>", "<nduid>"]},
-     {"manifest": "600070-600119", "devices": "*"}
+     {"manifest": "600119-600120", "devices": "*"}
    ]}
    ```
 

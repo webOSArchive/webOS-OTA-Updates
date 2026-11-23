@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Turn a payload's manifest-inputs.json into a signed CE OTA manifest.
 
-    tools/sign-manifest.py ../../webos-doctor-ce/out/ota/600070-600119/manifest-inputs.json \
+    tools/sign-manifest.py ../../webos-doctor-ce/out/ota/600070-600120/manifest-inputs.json \
         [--title "webOS CE 3.2.0"] [--install-minutes 10] [--copy-payload]
 
 Writes ce-ota/manifests/<from>-<to>.json and .json.sig (base64 of an RSA-4096

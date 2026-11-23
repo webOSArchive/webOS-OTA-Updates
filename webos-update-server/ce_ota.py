@@ -18,8 +18,8 @@ believes anything in it, including the payload URL:
 Who is offered what is decided here, in ce-ota/releases.json:
 
     {"releases": [
-        {"manifest": "600070-600119", "devices": ["<nduid>", "<nduid>"]},
-        {"manifest": "600070-600119", "devices": "*"}
+        {"manifest": "600070-600120", "devices": ["<nduid>", "<nduid>"]},
+        {"manifest": "600070-600120", "devices": "*"}
     ]}
 
 "devices" is "*" (every device on that build) or a list of nduids, so the same
