@@ -14,7 +14,7 @@
   "md5": "db7c44a78d994849cde4b18663b1f4e3",
   "sha256": "20a8c5ff6e921e2b54ba494bd61f605f0ccf2b12173f9bd18d12f5620550fa3e",
   "size": 51891826,
-  "url": "/api/ce-ota/payloads/600070-600120_org.webosarchive.ce-ota-3.2.0_600120_all.ipk"
+  "url": "/api/ce-ota/payloads/ce-ota-600070-600120.ipk"
  },
  "preflight": {
   "md5": "adb25d87c7a8070b90c84bcc0b3b6777",

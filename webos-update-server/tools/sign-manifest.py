@@ -9,8 +9,7 @@ SHA-256 PKCS#1 v1.5 signature: what /usr/bin/ce-ota-verify on the device checks)
 then verifies the pair with the public key before exiting. --copy-payload also
 copies the ipk (found next to manifest-inputs.json, sha256 checked) into
 ce-ota/payloads/ for a local server; production gets it by hand. On a server the
-ipk is named <from>-<to>_<payload.file> (the manifest's url says so); manifests
-signed before 2026-11-23 name the bare payload.file.
+ipk is named after its route, ce-ota-<from>-<to>.ipk (the manifest's url says so).
 
 Signing needs keys/ce-ota-signing.key (never committed). Writing the manifest
 offers nothing to anyone: ce-ota/releases.json decides who sees it.
@@ -69,9 +68,9 @@ def main():
     name = "%s-%s" % (mi["from"]["buildmark"], mi["to"]["buildmark"])
     # The ipk is named after its target build alone, so two payloads to the same
     # build (600070-600120 and 600119-600120) share a file name. On the server each
-    # is stored under its manifest's name; the device still stages and installs it
-    # as payload.file, the package name the OTA path has always used.
-    served = "%s_%s" % (name, mi["payload"]["file"])
+    # is named after its route, ce-ota-<from>-<to>.ipk; the device still stages and
+    # installs it as payload.file, the package name the OTA path has always used.
+    served = "ce-ota-%s.ipk" % name
     manifest = {
         "format": FORMAT,
         "name": name,
