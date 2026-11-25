@@ -1,0 +1,32 @@
+{
+ "format": 1,
+ "from": {
+  "buildmark": "600071",
+  "version": "webOS CE 3.1.0"
+ },
+ "name": "600071-600122",
+ "offer": {
+  "installMinutes": 10,
+  "title": "webOS Community Edition 3.2.0"
+ },
+ "payload": {
+  "file": "org.webosarchive.ce-ota-3.2.0_600122_all.ipk",
+  "md5": "32c070d0ec27f1ad6ffb191384ed6535",
+  "sha256": "ee3f5113039e337c1cc6c8e7e2c2df2ded5240852dbadc5568f8b91cf9a0ce92",
+  "size": 52145592,
+  "url": "/api/ce-ota/payloads/ce-ota-600071-600122.ipk"
+ },
+ "preflight": {
+  "md5": "e41d5998df2f80a2bf176dde32b8173b",
+  "path": "/usr/lib/ipkg/info/org.webosarchive.ce-files.md5sums"
+ },
+ "space": {
+  "largest_file": 12833057,
+  "rootfs_growth": 58339823
+ },
+ "tier": "armed-flash",
+ "to": {
+  "buildmark": "600122",
+  "version": "webOS CE 3.2.0"
+ }
+}
