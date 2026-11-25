@@ -7,7 +7,7 @@
  "name": "600105-600121",
  "offer": {
   "installMinutes": 10,
-  "title": "webOS CE 3.2.0 Beta 3 (600121)"
+  "title": "webOS Community Edition 3.2.0"
  },
  "payload": {
   "file": "org.webosarchive.ce-ota-3.2.0_600121_all.ipk",
